@@ -2,6 +2,8 @@ import os
 import base64
 from typing import Optional, Dict, Any
 
+import certifi
+
 import numpy as np
 import cv2
 import requests
@@ -43,7 +45,7 @@ def load_image_from_request(req: AnalyzeReq) -> np.ndarray:
 
     if req.image_url:
         try:
-            r = requests.get(req.image_url, timeout=25)
+            r = requests.get(req.image_url, timeout=25, verify=certifi.where())
             r.raise_for_status()
         except Exception as e:
             raise HTTPException(400, f"Cannot download image_url: {e}")
