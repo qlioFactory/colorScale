@@ -44,15 +44,27 @@ def load_image_from_request(req: AnalyzeReq) -> np.ndarray:
         return img
 
     if req.image_url:
-        try:
-            r = requests.get(req.image_url, timeout=25, verify=certifi.where())
-            r.raise_for_status()
-        except Exception as e:
-            raise HTTPException(400, f"Cannot download image_url: {e}")
-        img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
-        if img is None:
-            raise HTTPException(400, "Invalid image_url content (cannot decode)")
-        return img
+    try:
+        headers = {
+            # Un User-Agent “humano” y estable (evita 403 en muchos sitios)
+            "User-Agent": "ColorScale/1.0 (+https://github.com/qlioFactory/colorScale)",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+        r = requests.get(
+            req.image_url,
+            timeout=25,
+            verify=certifi.where(),
+            headers=headers,
+            allow_redirects=True,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        raise HTTPException(400, f"Cannot download image_url: {e}")
+
+    img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(400, "Invalid image_url content (cannot decode)")
+    return img
 
     raise HTTPException(400, "Provide image_url or image_base64")
 
