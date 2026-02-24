@@ -12,7 +12,8 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
 API_KEY = os.getenv("API_KEY", "")
-SWATCHES_PATH = os.getenv("SWATCHES_PATH", "swatches.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SWATCHES_PATH = os.getenv("SWATCHES_PATH", os.path.join(BASE_DIR, "swatches.json"))
 
 PARAM_ORDER = [
     "pH", "chloride", "gh", "alkalinity", "iron",
