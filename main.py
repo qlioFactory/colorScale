@@ -27,9 +27,8 @@ TARGET_BARS_RGB = {
     "GRIS": [128, 128, 128],
 }
 
-app = FastAPI(title="ColorScale API", version="0.2.0")
+app = FastAPI(title="ColorScale API", version="0.2.1")
 
-# CORS abierto para integración con Base44/frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -114,54 +113,83 @@ def find_peak_span(score: np.ndarray, peak_idx: int, frac: float = 0.55) -> Tupl
     return l, r
 
 
-def sample_patch_median(img_rgb: np.ndarray, cx: int, cy: int, rx: int = 4, ry: int = 6) -> np.ndarray:
+# ---------------------------
+# Robust sampling + glare reject
+# ---------------------------
+def robust_patch_median_rgb(img_rgb: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> np.ndarray:
+    """
+    Mediana robusta: elimina el 10% más brillante (reflejos) antes de calcular mediana.
+    """
     h, w = img_rgb.shape[:2]
-    x0 = max(0, int(cx - rx))
-    x1 = min(w, int(cx + rx + 1))
-    y0 = max(0, int(cy - ry))
-    y1 = min(h, int(cy + ry + 1))
-    patch = img_rgb[y0:y1, x0:x1]
+    x0 = max(0, min(w - 1, int(x0)))
+    x1 = max(0, min(w, int(x1)))
+    y0 = max(0, min(h - 1, int(y0)))
+    y1 = max(0, min(h, int(y1)))
 
-    if patch.size == 0:
-        return np.array([255.0, 255.0, 255.0], dtype=np.float32)
-
-    med = np.median(patch.reshape(-1, 3), axis=0)
-    return med.astype(np.float32)
-
-
-def sample_bar_color(img_rgb: np.ndarray, x_center: int, y_top: int, y_bottom: int, rx: int = 8) -> np.ndarray:
-    h, w = img_rgb.shape[:2]
-    x0 = max(0, int(x_center - rx))
-    x1 = min(w, int(x_center + rx + 1))
-
-    margin = max(8, int((y_bottom - y_top) * 0.12))
-    yy0 = max(0, int(y_top + margin))
-    yy1 = min(h, int(y_bottom - margin))
-    if yy1 <= yy0:
-        yy0 = max(0, int(y_top))
-        yy1 = min(h, int(y_bottom))
-
-    patch = img_rgb[yy0:yy1, x0:x1]
-    if patch.size == 0:
+    if x1 <= x0 or y1 <= y0:
         return np.array([128.0, 128.0, 128.0], dtype=np.float32)
 
-    med = np.median(patch.reshape(-1, 3), axis=0)
-    return med.astype(np.float32)
+    patch = img_rgb[y0:y1, x0:x1].reshape(-1, 3).astype(np.float32)
+    if patch.shape[0] < 10:
+        return np.median(patch, axis=0).astype(np.float32)
+
+    lum = patch.mean(axis=1)
+    thr = np.percentile(lum, 90)  # quitar el 10% más brillante
+    good = patch[lum <= thr]
+    if good.shape[0] < 10:
+        good = patch
+
+    return np.median(good, axis=0).astype(np.float32)
+
+
+def sample_patch_median(img_rgb: np.ndarray, cx: int, cy: int, rx: int = 6, ry: int = 8) -> np.ndarray:
+    x0, x1 = cx - rx, cx + rx + 1
+    y0, y1 = cy - ry, cy + ry + 1
+    return robust_patch_median_rgb(img_rgb, x0, y0, x1, y1)
+
+
+def sample_bar_color(img_rgb: np.ndarray, x_center: int, y_top: int, y_bottom: int, rx: int = 10) -> np.ndarray:
+    margin = max(10, int((y_bottom - y_top) * 0.12))
+    y0 = y_top + margin
+    y1 = y_bottom - margin
+    x0 = x_center - rx
+    x1 = x_center + rx + 1
+    return robust_patch_median_rgb(img_rgb, x0, y0, x1, y1)
+
+
+# ---------------------------
+# Color calibration in linear RGB (more stable)
+# ---------------------------
+def srgb_to_linear_u8(rgb_u8: np.ndarray) -> np.ndarray:
+    x = np.clip(rgb_u8.astype(np.float32) / 255.0, 0.0, 1.0)
+    a = 0.055
+    lin = np.where(x <= 0.04045, x / 12.92, ((x + a) / (1 + a)) ** 2.4)
+    return lin
+
+
+def linear_to_srgb_u8(lin: np.ndarray) -> np.ndarray:
+    lin = np.clip(lin.astype(np.float32), 0.0, 1.0)
+    a = 0.055
+    x = np.where(lin <= 0.0031308, 12.92 * lin, (1 + a) * (lin ** (1 / 2.4)) - a)
+    return np.clip(np.round(x * 255.0), 0, 255).astype(np.uint8)
 
 
 def fit_channel_linear_correction(obs_bars: Dict[str, np.ndarray]) -> np.ndarray:
     """
-    Ajuste lineal por canal: out_c = a_c * in_c + b_c
-    (más estable que una matriz 3x3 completa en esta fase)
+    Ajuste lineal por canal en espacio LINEAR RGB:
+    out_lin = a * in_lin + b
     """
     names = ["ROJO", "VERDE", "AZUL", "GRIS"]
-    obs_mat = np.array([obs_bars[n] for n in names], dtype=np.float32)
-    tgt_mat = np.array([TARGET_BARS_RGB[n] for n in names], dtype=np.float32)
+    obs = np.array([obs_bars[n] for n in names], dtype=np.float32)  # 0..255
+    tgt = np.array([TARGET_BARS_RGB[n] for n in names], dtype=np.float32)  # 0..255
+
+    obs_lin = srgb_to_linear_u8(obs)  # 0..1
+    tgt_lin = srgb_to_linear_u8(tgt)  # 0..1
 
     params = np.zeros((3, 2), dtype=np.float32)
     for c in range(3):
-        x = obs_mat[:, c]
-        y = tgt_mat[:, c]
+        x = obs_lin[:, c]
+        y = tgt_lin[:, c]
         A = np.vstack([x, np.ones_like(x)]).T
         sol, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
         params[c, 0] = float(sol[0])  # a
@@ -171,19 +199,22 @@ def fit_channel_linear_correction(obs_bars: Dict[str, np.ndarray]) -> np.ndarray
 
 
 def apply_channel_linear(rgb: np.ndarray, params: np.ndarray) -> np.ndarray:
+    """
+    Aplica corrección en linear RGB y vuelve a sRGB (0..255).
+    Devuelve float32.
+    """
     rgb = np.asarray(rgb, dtype=np.float32)
-    out = np.array([
-        params[0, 0] * rgb[0] + params[0, 1],
-        params[1, 0] * rgb[1] + params[1, 1],
-        params[2, 0] * rgb[2] + params[2, 1],
+    lin = srgb_to_linear_u8(rgb)
+    out_lin = np.array([
+        params[0, 0] * lin[0] + params[0, 1],
+        params[1, 0] * lin[1] + params[1, 1],
+        params[2, 0] * lin[2] + params[2, 1],
     ], dtype=np.float32)
-    return np.clip(out, 0, 255)
+    out_u8 = linear_to_srgb_u8(out_lin)
+    return out_u8.astype(np.float32)
 
 
 def rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
-    """
-    RGB (0..255) -> CIELab aproximado usando OpenCV.
-    """
     rgb_u8 = np.uint8([[np.clip(np.round(rgb), 0, 255).astype(np.uint8)]])
     lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB)[0, 0].astype(np.float32)
     return np.array([lab[0] * 100.0 / 255.0, lab[1] - 128.0, lab[2] - 128.0], dtype=np.float32)
@@ -219,7 +250,6 @@ def match_swatch(param: str, rgb: np.ndarray, swatches: Dict[str, Any]) -> Dict[
 def detect_geometry(img_rgb: np.ndarray) -> Dict[str, Any]:
     h, w = img_rgb.shape[:2]
 
-    # Perfil por columnas en zona central para detectar franjas
     ys0, ys1 = int(h * 0.15), int(h * 0.85)
     col = img_rgb[ys0:ys1].astype(np.float32).mean(axis=0)
     R, G, B = col[:, 0], col[:, 1], col[:, 2]
@@ -239,7 +269,6 @@ def detect_geometry(img_rgb: np.ndarray) -> Dict[str, Any]:
     if red_score[red_x] < 25 or green_score[green_x] < 20 or blue_score[blue_x] < 20:
         raise ValueError("No se detectan correctamente las franjas de referencia RGB")
 
-    # La tira SIEMPRE está entre azul y verde, aunque el usuario invierta izquierda/derecha
     if blue_x < green_x:
         orientation = "gray-blue-strip-green-red"
         strip_left = blue_span[1] + 8
@@ -257,7 +286,6 @@ def detect_geometry(img_rgb: np.ndarray) -> Dict[str, Any]:
     if strip_right - strip_left < 20:
         raise ValueError("No se pudo aislar la zona de la tira entre azul y verde")
 
-    # Altura útil de las franjas de color (para saber el rango vertical de análisis)
     def color_dom_profile(x: int, mode: str) -> np.ndarray:
         c = img_rgb[:, max(0, x - 2):min(w, x + 3)].astype(np.float32).mean(axis=1)
         rr, gg, bb = c[:, 0], c[:, 1], c[:, 2]
@@ -293,7 +321,6 @@ def detect_geometry(img_rgb: np.ndarray) -> Dict[str, Any]:
     bars_y_top = int(np.median(np.array(tops)))
     bars_y_bottom = int(np.median(np.array(bottoms)))
 
-    # Detectar top/bottom de los pads a partir de bordes horizontales en el centro de la tira
     strip_center_x = int((strip_left + strip_right) / 2)
 
     gray_img = cv2.cvtColor(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -317,7 +344,6 @@ def detect_geometry(img_rgb: np.ndarray) -> Dict[str, Any]:
         pads_y_top = int(bars_y_top)
         pads_y_bottom = int(bars_y_bottom)
 
-    # Centro aproximado de la franja gris (para corrección de color)
     bg_gap = abs(green_x - blue_x)
     gray_x = int(round(blue_x + gray_dir * 0.45 * bg_gap))
     gray_x = max(0, min(w - 1, gray_x))
@@ -349,14 +375,46 @@ def analyze_image(img_bgr: np.ndarray, debug: bool = False) -> Dict[str, Any]:
 
     geom = detect_geometry(img_rgb)
 
-    # Muestreo de franjas y corrección de color por canal (suave)
+    # Muestreo robusto de franjas (descarta brillos)
     obs_bars = {
-        "ROJO": sample_bar_color(img_rgb, geom["red_x"], geom["bars_y_top"], geom["bars_y_bottom"], rx=8),
-        "VERDE": sample_bar_color(img_rgb, geom["green_x"], geom["bars_y_top"], geom["bars_y_bottom"], rx=8),
-        "AZUL": sample_bar_color(img_rgb, geom["blue_x"], geom["bars_y_top"], geom["bars_y_bottom"], rx=8),
-        "GRIS": sample_bar_color(img_rgb, geom["gray_x"], geom["bars_y_top"], geom["bars_y_bottom"], rx=8),
+        "ROJO": sample_bar_color(img_rgb, geom["red_x"], geom["bars_y_top"], geom["bars_y_bottom"], rx=10),
+        "VERDE": sample_bar_color(img_rgb, geom["green_x"], geom["bars_y_top"], geom["bars_y_bottom"], rx=10),
+        "AZUL": sample_bar_color(img_rgb, geom["blue_x"], geom["bars_y_top"], geom["bars_y_bottom"], rx=10),
+        "GRIS": sample_bar_color(img_rgb, geom["gray_x"], geom["bars_y_top"], geom["bars_y_bottom"], rx=10),
     }
+
+    # Calibración en linear RGB
     color_params = fit_channel_linear_correction(obs_bars)
+
+    # Score de calibración (si es malo, retake)
+    errs = []
+    for k in ["ROJO", "VERDE", "AZUL", "GRIS"]:
+        corr = apply_channel_linear(obs_bars[k], color_params)
+        tgt = np.array(TARGET_BARS_RGB[k], dtype=np.float32)
+        errs.append(float(np.linalg.norm(corr - tgt)))
+    calib_err = float(np.mean(errs))
+
+    if calib_err > 35.0:
+        return {
+            "ok": False,
+            "orientation": geom["orientation"],
+            "results": [],
+            "diagnostics": {
+                "imageSize": [int(w), int(h)],
+                "foundBars": True,
+                "calibrationError": round(calib_err, 2),
+                "foundPads": 0,
+                "blurScore": None,
+                "warnings": ["Calibración inestable (posibles reflejos/sombras)."],
+                "referenceBarsObserved": {k: [int(round(x)) for x in v.tolist()] for k, v in obs_bars.items()},
+            },
+            "retake_reason": "Iluminación no estable (reflejos/sombras). Repite la foto.",
+            "retake_tips": [
+                "Evita reflejos directos sobre la tira",
+                "Usa luz uniforme",
+                "Alinea la tira centrada entre las franjas azul y verde",
+            ],
+        }
 
     pads_top = int(geom["pads_y_top"])
     pads_bottom = int(geom["pads_y_bottom"])
@@ -365,8 +423,8 @@ def analyze_image(img_bgr: np.ndarray, debug: bool = False) -> Dict[str, Any]:
 
     strip_center_x = int(geom["strip_center_x"])
     strip_width = max(10, int(geom["strip_right"] - geom["strip_left"]))
-    rx = max(3, min(6, strip_width // 14))
-    ry = max(4, min(7, int(pitch * 0.10)))
+    rx = max(4, min(8, strip_width // 12))
+    ry = max(5, min(10, int(pitch * 0.14)))
 
     results = []
     deltaes = []
@@ -374,17 +432,17 @@ def analyze_image(img_bgr: np.ndarray, debug: bool = False) -> Dict[str, Any]:
     for i, param in enumerate(PARAM_ORDER):
         cy = int(round(pads_top + (i + 0.5) * pitch))
 
+        # Muestreo robusto del pad (descarta brillos)
         rgb_raw = sample_patch_median(img_rgb, strip_center_x, cy, rx=rx, ry=ry)
         rgb_corr = apply_channel_linear(rgb_raw, color_params)
 
         m_raw = match_swatch(param, rgb_raw, swatches)
         m_corr = match_swatch(param, rgb_corr, swatches)
 
-        # Usar corregido solo si mejora claramente y no "revienta" la saturación
         corr_clip_count = int(np.sum((rgb_corr <= 2) | (rgb_corr >= 253)))
         use_corrected = (
-            (m_corr["deltaE"] + 2.0 < m_raw["deltaE"])
-            and (m_corr["deltaE"] < 30.0)
+            (m_corr["deltaE"] + 1.5 < m_raw["deltaE"])
+            and (m_corr["deltaE"] < 32.0)
             and (corr_clip_count <= 1)
         )
 
@@ -431,7 +489,7 @@ def analyze_image(img_bgr: np.ndarray, debug: bool = False) -> Dict[str, Any]:
         "diagnostics": {
             "imageSize": [int(w), int(h)],
             "foundBars": True,
-            "calibrationError": None,
+            "calibrationError": round(calib_err, 2),
             "foundPads": 10,
             "blurScore": None,
             "matchMeanDeltaE": round(mean_delta, 2) if mean_delta is not None else None,
@@ -502,13 +560,12 @@ def load_image_from_request(req: AnalyzeReq) -> np.ndarray:
 def health() -> Dict[str, Any]:
     return {
         "ok": True,
-        "swatchesLoaded": os.path.exists(SWATCHES_PATH)
+        "swatchesLoaded": os.path.exists(SWATCHES_PATH),
     }
 
 
 @app.post("/analyze-strip")
 def analyze_strip(req: AnalyzeReq, x_api_key: str = Header(default="")) -> Dict[str, Any]:
-    # Seguridad mínima
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(401, "Unauthorized")
 
