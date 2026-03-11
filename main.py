@@ -17,8 +17,16 @@ SWATCHES_PATH = os.getenv("SWATCHES_PATH", os.path.join(BASE_DIR, "swatches.json
 
 # Orden actual (pendiente de confirmar con el cliente antes de cambiarlo)
 PARAM_ORDER = [
-    "pH", "chloride", "gh", "alkalinity", "iron",
-    "copper", "aluminium", "sulfate", "nitrate", "free_chlorine"
+    "alkalinity",
+    "pH",
+    "gh",
+    "free_chlorine",
+    "nitrate",
+    "copper",
+    "iron",
+    "aluminium",
+    "sulfate",
+    "chloride",
 ]
 
 TARGET_BARS_RGB = {
