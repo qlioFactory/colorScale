@@ -1,6 +1,8 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pydantic==2.8.2
-numpy==2.1.0
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+numpy==2.2.1
 opencv-python-headless==4.10.0.84
 requests==2.32.3
+certifi==2024.12.14
+python-multipart==0.0.20
