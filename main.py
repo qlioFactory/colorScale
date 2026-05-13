@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 # Config
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "2.1.0-overwrite-calibration"
+APP_VERSION = "2.1.1-base44-compat"
 BASE_DIR = Path(__file__).resolve().parent
 
 API_KEY = os.getenv("API_KEY", "")
@@ -100,8 +100,12 @@ class AnalyzeReq(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
+    # `ok` and `status` are kept as transport/UI compatibility fields for Base44.
+    # A low-quality but completed analysis must not be treated as a proxy error by
+    # the frontend; the real photo-quality verdict is exposed in `photo_status`.
     ok: bool
     status: str
+    photo_status: Optional[str] = None
     quality_score: float = 0.0
     analysis_id: Optional[str] = None
     orientation: Optional[str] = None
@@ -996,7 +1000,14 @@ def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
         warnings.append("La tira aparece estrecha; acerca la cámara o usa mayor resolución")
 
     photo_status = "ok" if quality_score >= 0.42 else "foto_no_fiable"
-    ok = photo_status == "ok"
+
+    # Base44 compatibility:
+    # The current frontend/proxy treats `ok: false` or a non-`ok` top-level status
+    # as a transport error and shows the raw JSON as "Error proxy".
+    # If the image was actually processed and we have the 10 pad results, return a
+    # successful transport response and expose the low-quality verdict separately.
+    transport_ok = True
+    compatibility_status = "ok"
 
     diagnostics: Dict[str, Any] = {
         "version": APP_VERSION,
@@ -1033,16 +1044,17 @@ def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
         ]
 
     return {
-        "ok": ok,
-        "status": photo_status,
+        "ok": transport_ok,
+        "status": compatibility_status,
+        "photo_status": photo_status,
         "quality_score": quality_score,
         "analysis_id": None,
         "orientation": geom["orientation"],
         "results": results,
         "diagnostics": diagnostics,
-        "retake_reason": None if ok else "La foto no es suficientemente fiable para una medición automática",
+        "retake_reason": None if photo_status == "ok" else "La foto no es suficientemente fiable para una medición automática",
         "retake_tips": []
-        if ok and not warnings
+        if photo_status == "ok" and not warnings
         else [
             "Usa luz uniforme y evita reflejos directos sobre la tira",
             "Mantén la cámara perpendicular a la plantilla",
@@ -1059,7 +1071,8 @@ def failure_response(img_rgb: Optional[np.ndarray], message: str) -> Dict[str, A
         size = [int(w), int(h)]
     return {
         "ok": False,
-        "status": "foto_no_fiable",
+        "status": "error",
+        "photo_status": "foto_no_fiable",
         "quality_score": 0.0,
         "analysis_id": None,
         "orientation": None,
