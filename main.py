@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 # Config
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "2.1.1-base44-compat"
+APP_VERSION = "2.2.0-conservative-calibration"
 BASE_DIR = Path(__file__).resolve().parent
 
 API_KEY = os.getenv("API_KEY", "")
@@ -750,42 +750,85 @@ def build_swatch_distances(rgb: np.ndarray, meta: Dict[str, Any]) -> List[Tuple[
     return sorted(distances, key=lambda x: x[0])
 
 
-def match_swatch(param: str, raw_rgb: np.ndarray, cal_rgb: np.ndarray, meta: Dict[str, Any]) -> Dict[str, Any]:
+def build_weighted_lab_distances(rgb: np.ndarray, meta: Dict[str, Any], lightness_weight: float = 0.18) -> List[Tuple[float, int]]:
+    """
+    Distance for very pale reagents.
+
+    For white/pale pads, phone exposure and shadows change L* much more than the
+    useful chemical signal. Comparing a,b* with reduced L* weight prevents a
+    neutral grey/white pad photographed under low light from being interpreted as
+    a high pink/yellow concentration.
+    """
+    lab = rgb_to_lab_cv(rgb)
+    distances: List[Tuple[float, int]] = []
+    for idx, ref_rgb in enumerate(meta["rgb"]):
+        ref_lab = rgb_to_lab_cv(np.array(ref_rgb, dtype=np.float32))
+        d = lab - ref_lab
+        weighted = float(np.sqrt((lightness_weight * d[0]) ** 2 + d[1] ** 2 + d[2] ** 2))
+        distances.append((weighted, idx))
+    return sorted(distances, key=lambda x: x[0])
+
+
+def match_swatch(
+    param: str,
+    raw_rgb: np.ndarray,
+    cal_rgb: np.ndarray,
+    meta: Dict[str, Any],
+    prefer_raw: bool = False,
+) -> Dict[str, Any]:
     raw_distances = build_swatch_distances(raw_rgb, meta)
     cal_distances = build_swatch_distances(cal_rgb, meta)
 
-    # Default to calibrated color. Use raw only when calibration clearly makes a
-    # pale patch worse or clips too aggressively.
     cal_clip_count = int(np.sum((cal_rgb <= 2) | (cal_rgb >= 253)))
     raw_best, raw_idx = raw_distances[0]
     cal_best, cal_idx = cal_distances[0]
-    mode = "calibrated"
-    distances = cal_distances
-    used_rgb = cal_rgb
 
     L_cal, chroma_cal, lum_cal = rgb_luminance_chroma(cal_rgb)
     L_raw, chroma_raw, lum_raw = rgb_luminance_chroma(raw_rgb)
 
+    # Pale/white reagent pads are the most sensitive to shadows and camera
+    # exposure. Do not use the saturated-bar calibration for these pads because
+    # it can inject a magenta/blue cast when the four reference bars do not fit a
+    # single RGB linear model. Instead, match mostly by hue/chroma and force truly
+    # neutral pads to the lowest concentration.
     if param in WHITE_LIKE_PARAMS:
-        # If the photographed pad is near-white, favor the lowest values. This
-        # prevents small shadows/phone white balance from being interpreted as a
-        # higher pink/yellow concentration.
         numeric_values = meta.get("numeric_values") or [numeric_value(v) for v in meta["values"]]
         lowest_idx = int(np.argmin(np.array(numeric_values, dtype=np.float32)))
-        if (L_cal >= 91.0 and chroma_cal <= 7.0) or (L_raw >= 90.0 and chroma_raw <= 7.5):
-            forced_distances = [(delta_e(rgb_to_lab_cv(cal_rgb), rgb_to_lab_cv(np.array(meta["rgb"][lowest_idx], dtype=np.float32))), lowest_idx)]
-            for d, idx in cal_distances:
+        weighted_raw = build_weighted_lab_distances(raw_rgb, meta, lightness_weight=0.16)
+        mode = "raw_white_weighted_lab"
+        distances = weighted_raw
+        used_rgb = raw_rgb
+
+        if L_raw >= 45.0 and chroma_raw <= 8.0:
+            forced_distances = [
+                (build_weighted_lab_distances(raw_rgb, meta, lightness_weight=0.16)[lowest_idx][0] if False else weighted_raw[0][0], lowest_idx)
+            ]
+            for d, idx in weighted_raw:
                 if idx != lowest_idx:
                     forced_distances.append((d, idx))
             distances = forced_distances
-            mode = "calibrated_white_bias"
+            mode = "raw_white_neutral_bias"
+
+        # If the image is genuinely bright and calibration did not distort the
+        # color, allow the old bright-white guard as a secondary path.
+        elif not prefer_raw and cal_clip_count < 2 and L_cal >= 91.0 and chroma_cal <= 7.0:
+            distances = [(cal_distances[0][0], lowest_idx)] + [(d, idx) for d, idx in cal_distances if idx != lowest_idx]
+            mode = "calibrated_white_bright_bias"
             used_rgb = cal_rgb
-        elif cal_clip_count >= 2 and raw_best < cal_best + 4.0:
-            mode = "raw_white_fallback"
+
+    else:
+        # Default to calibrated color only when the reference-bar calibration is
+        # internally reliable. If the reference residuals are high, full
+        # calibration is more likely to over-correct than help, so use raw RGB.
+        mode = "calibrated"
+        distances = cal_distances
+        used_rgb = cal_rgb
+
+        if prefer_raw:
+            mode = "raw_unreliable_calibration"
             distances = raw_distances
             used_rgb = raw_rgb
-    else:
-        if cal_clip_count >= 2 and raw_best + 3.0 < cal_best:
+        elif cal_clip_count >= 2 and raw_best + 3.0 < cal_best:
             mode = "raw_clip_fallback"
             distances = raw_distances
             used_rgb = raw_rgb
@@ -911,6 +954,13 @@ def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
     ref_error_mean = float(np.mean(list(ref_errors_de.values())))
     ref_error_max = float(np.max(list(ref_errors_de.values())))
 
+    # If the four reference bars cannot be mapped to their target colors with a
+    # low residual, do not force that calibration onto the chemical pads. This
+    # happens with some Android photos, printed/laminated templates or uneven
+    # warm light. Geometry can still be valid, so continue with conservative raw
+    # matching rather than failing the scan.
+    prefer_raw_matching = bool(ref_error_mean > 16.0 or ref_error_max > 32.0)
+
     sample_rects = sample_pad_rects(geom)
     results: List[Dict[str, Any]] = []
     match_errors: List[float] = []
@@ -930,7 +980,7 @@ def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
         )
         cal_rgb = calibrate(raw_rgb)
         meta = swatches[param]
-        match = match_swatch(param, raw_rgb, cal_rgb, meta)
+        match = match_swatch(param, raw_rgb, cal_rgb, meta, prefer_raw=prefer_raw_matching)
         match_errors.append(float(match["deltaE"]))
 
         # Temporary confidence; refined after global quality is known.
@@ -988,6 +1038,8 @@ def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
         if r["confidence"] == "low":
             low_conf_count += 1
 
+    if prefer_raw_matching:
+        warnings.append("Calibración conservadora activada: se evita una corrección RGB agresiva por residuo alto en las barras de referencia")
     if ref_error_mean > 13.0:
         warnings.append("Calibración de color sensible: la luz no parece uniforme sobre la plantilla")
     if ref_error_max > 25.0:
@@ -1015,6 +1067,7 @@ def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
         "foundBars": True,
         "foundPads": 10,
         "transformType": "per_channel_linear_srgb",
+        "matchingMode": "raw_conservative" if prefer_raw_matching else "calibrated",
         "deltaEFormula": "CIEDE2000",
         "referenceErrorMean": round(ref_error_mean, 2),
         "referenceErrorMax": round(ref_error_max, 2),
