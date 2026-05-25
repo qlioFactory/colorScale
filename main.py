@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 # Config
 # -----------------------------------------------------------------------------
 
-APP_VERSION = "2.2.0-conservative-calibration"
+APP_VERSION = "2.3.0-local-blank-and-rotation"
 BASE_DIR = Path(__file__).resolve().parent
 
 API_KEY = os.getenv("API_KEY", "")
@@ -703,6 +703,62 @@ def sample_pad_rects(geom: Dict[str, Any]) -> List[Tuple[int, int, int, int, int
     return rects
 
 
+def estimate_local_blank_rgb(
+    img_rgb: np.ndarray,
+    sample_rects: List[Tuple[int, int, int, int, int, int]],
+    index: int,
+    raw_rgb: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Estimate the local unreacted strip/background color near a pad.
+
+    White/pale reagents on the Redmi photos are often photographed as beige or
+    grey due to exposure, shadows and plastic glare. Sampling the blank strip
+    immediately above/below the pad lets us tell apart a real chemical color
+    change from the same warm/dark cast affecting the whole strip.
+    """
+
+    if index < 0 or index >= len(sample_rects):
+        return None
+
+    x, y, w, h, cx, cy = sample_rects[index]
+    candidates: List[np.ndarray] = []
+
+    # Gaps between neighbouring pads are blank strip. Sample both adjacent gaps
+    # and keep the one most similar to the current pad; this avoids using a gap
+    # contaminated by the previous/next coloured reagent.
+    for upper_idx, lower_idx in ((index - 1, index), (index, index + 1)):
+        if upper_idx < 0 or lower_idx >= len(sample_rects):
+            continue
+        ux, uy, uw, uh, ucx, ucy = sample_rects[upper_idx]
+        lx, ly, lw, lh, lcx, lcy = sample_rects[lower_idx]
+        gap_top = int(uy + uh)
+        gap_bottom = int(ly)
+        gap_h = gap_bottom - gap_top
+        if gap_h < max(6, int(h * 0.45)):
+            continue
+
+        gy0 = int(gap_top + 0.22 * gap_h)
+        gy1 = int(gap_bottom - 0.22 * gap_h)
+        gx0 = int(cx - max(5, w * 0.45))
+        gx1 = int(cx + max(5, w * 0.45))
+        rgb, _bright, _dark = robust_patch_stats_rgb(
+            img_rgb, gx0, gy0, gx1, gy1, reject_bright_pct=92.0, reject_dark_pct=2.0
+        )
+        candidates.append(rgb)
+
+    if not candidates:
+        return None
+
+    raw_lab = rgb_to_lab_cv(raw_rgb)
+    def score(candidate: np.ndarray) -> float:
+        cand_lab = rgb_to_lab_cv(candidate)
+        # Prefer a nearby blank with similar luminance/chroma to the pad.
+        return delta_e(raw_lab, cand_lab)
+
+    candidates = sorted(candidates, key=score)
+    return candidates[0].astype(np.float32)
+
+
 # -----------------------------------------------------------------------------
 # Matching and status
 # -----------------------------------------------------------------------------
@@ -775,6 +831,7 @@ def match_swatch(
     cal_rgb: np.ndarray,
     meta: Dict[str, Any],
     prefer_raw: bool = False,
+    local_blank_rgb: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     raw_distances = build_swatch_distances(raw_rgb, meta)
     cal_distances = build_swatch_distances(cal_rgb, meta)
@@ -799,14 +856,43 @@ def match_swatch(
         distances = weighted_raw
         used_rgb = raw_rgb
 
-        if L_raw >= 45.0 and chroma_raw <= 8.0:
-            forced_distances = [
-                (build_weighted_lab_distances(raw_rgb, meta, lightness_weight=0.16)[lowest_idx][0] if False else weighted_raw[0][0], lowest_idx)
-            ]
-            for d, idx in weighted_raw:
-                if idx != lowest_idx:
-                    forced_distances.append((d, idx))
-            distances = forced_distances
+        local_blank_delta: Optional[float] = None
+        if local_blank_rgb is not None:
+            local_blank_delta = delta_e(rgb_to_lab_cv(raw_rgb), rgb_to_lab_cv(local_blank_rgb))
+
+        def force_lowest(base_distances: List[Tuple[float, int]]) -> List[Tuple[float, int]]:
+            actual_lowest = next((float(d) for d, idx in base_distances if idx == lowest_idx), float(base_distances[0][0]))
+            best_any = float(base_distances[0][0])
+            # Make the lowest concentration win, but keep the reported distance
+            # close to the real competing match so confidence does not become
+            # artificially high.
+            forced = max(0.01, min(actual_lowest, best_any) - 0.01)
+            return [(forced, lowest_idx)] + [(float(d), int(idx)) for d, idx in base_distances if idx != lowest_idx]
+
+        # If the pad color is almost the same as the nearby blank strip, this is
+        # not a real reagent color change. This is the main Redmi 9 fix for
+        # copper/iron/pale pads photographed as beige by the camera.
+        local_thresholds = {
+            "free_chlorine": 11.0,
+            "nitrate": 8.5,
+            "copper": 8.5,
+            "iron": 11.0,
+            "aluminium": 7.0,
+        }
+        if local_blank_delta is not None and local_blank_delta <= local_thresholds.get(param, 8.0):
+            distances = force_lowest(weighted_raw)
+            mode = "raw_white_local_blank_bias"
+
+        # Chlorine/nitrate positives are pink/magenta. A warm beige/grey cast from
+        # light or plastic should still be treated as zero.
+        elif param in {"free_chlorine", "nitrate"} and L_raw >= 45.0 and raw_best <= 35.0:
+            lab_raw = rgb_to_lab_cv(raw_rgb)
+            if float(lab_raw[1]) < 10.0 and float(lab_raw[2]) > 0.0:
+                distances = force_lowest(weighted_raw)
+                mode = "raw_white_non_pink_bias"
+
+        elif L_raw >= 45.0 and chroma_raw <= 8.0:
+            distances = force_lowest(weighted_raw)
             mode = "raw_white_neutral_bias"
 
         # If the image is genuinely bright and calibration did not distort the
@@ -922,7 +1008,7 @@ def startup() -> None:
 # -----------------------------------------------------------------------------
 
 
-def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
+def _analyze_image_impl(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
     swatches = load_swatches()
     h, w = img_rgb.shape[:2]
     geom = detect_geometry(img_rgb)
@@ -980,7 +1066,10 @@ def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
         )
         cal_rgb = calibrate(raw_rgb)
         meta = swatches[param]
-        match = match_swatch(param, raw_rgb, cal_rgb, meta, prefer_raw=prefer_raw_matching)
+        local_blank_rgb = None
+        if param in WHITE_LIKE_PARAMS:
+            local_blank_rgb = estimate_local_blank_rgb(img_rgb, sample_rects, i, raw_rgb)
+        match = match_swatch(param, raw_rgb, cal_rgb, meta, prefer_raw=prefer_raw_matching, local_blank_rgb=local_blank_rgb)
         match_errors.append(float(match["deltaE"]))
 
         # Temporary confidence; refined after global quality is known.
@@ -1016,6 +1105,8 @@ def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
                 "sample_rgb_raw": to_int_list(raw_rgb),
                 "sample_rgb_calibrated": to_int_list(cal_rgb),
                 "sample_rgb_used": to_int_list(used_rgb),
+                "local_blank_rgb": to_int_list(local_blank_rgb) if local_blank_rgb is not None else None,
+                "local_blank_deltaE": round(float(delta_e(rgb_to_lab_cv(raw_rgb), rgb_to_lab_cv(local_blank_rgb))), 2) if local_blank_rgb is not None else None,
                 "glareRejectedPct": round(float(bright_rej), 2),
                 "darkRejectedPct": round(float(dark_rej), 2),
             }
@@ -1115,6 +1206,46 @@ def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
             "Asegura enfoque nítido y que se vean completas las barras de referencia",
         ],
     }
+
+
+def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
+    """Analyze an image, retrying common phone/gallery rotations.
+
+    Some Android/gallery uploads preserve pixels in landscape orientation even
+    when the visual preview looks rotated in the browser. The detector expects
+    vertical reference bars, so try rotations and keep the best successful scan.
+    """
+
+    rotations: List[Tuple[str, Optional[int]]] = [
+        ("none", None),
+        ("cw90", cv2.ROTATE_90_CLOCKWISE),
+        ("ccw90", cv2.ROTATE_90_COUNTERCLOCKWISE),
+        ("180", cv2.ROTATE_180),
+    ]
+    successes: List[Dict[str, Any]] = []
+    failures: List[str] = []
+
+    for label, code in rotations:
+        candidate = img_rgb if code is None else cv2.rotate(img_rgb, code)
+        try:
+            result = _analyze_image_impl(candidate, debug=debug)
+            result.setdefault("diagnostics", {})["inputRotationApplied"] = label
+            result.setdefault("diagnostics", {})["originalImageSize"] = [int(img_rgb.shape[1]), int(img_rgb.shape[0])]
+            successes.append(result)
+        except Exception as exc:
+            failures.append(f"{label}: {exc}")
+
+    if not successes:
+        raise ValueError("No se pudo detectar la plantilla en ninguna orientación: " + " | ".join(failures))
+
+    # Prefer the highest quality score. In ties, prefer no rotation to keep debug
+    # coordinates closer to the uploaded image.
+    def rank(item: Dict[str, Any]) -> Tuple[float, int]:
+        label = item.get("diagnostics", {}).get("inputRotationApplied", "none")
+        no_rotation_bonus = 1 if label == "none" else 0
+        return (float(item.get("quality_score", 0.0)), no_rotation_bonus)
+
+    return sorted(successes, key=rank, reverse=True)[0]
 
 
 def failure_response(img_rgb: Optional[np.ndarray], message: str) -> Dict[str, Any]:
