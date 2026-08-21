@@ -1,51 +1,27 @@
-"""
-ColorScale backend - overwrite v2-calibration
-
-Compatible with the existing Base44 frontend endpoint:
-  POST /analyze-strip
-
-Main goals:
-- No generative AI for color matching.
-- Detect the fixed template bars (gray, blue, green, red).
-- Calibrate the photographed sample color using the fixed reference bars.
-- Compare in CIELAB using Delta E 2000.
-- Return the nearest value, status, confidence and diagnostics.
-- Store historical results in a lightweight SQLite DB by default.
-"""
-
-from __future__ import annotations
-
 import base64
 import json
+import math
 import os
 import re
-import sqlite3
-import time
-import uuid
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import certifi
 import cv2
 import numpy as np
 import requests
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+VERSION = "0.4.0"
 
-APP_VERSION = "2.3.0-local-blank-and-rotation"
-BASE_DIR = Path(__file__).resolve().parent
-
-API_KEY = os.getenv("API_KEY", "")
-SWATCHES_PATH = Path(os.getenv("SWATCHES_PATH", str(BASE_DIR / "swatches.json")))
-HISTORY_DB_PATH = Path(os.getenv("HISTORY_DB_PATH", str(BASE_DIR / "colorscale_history.sqlite3")))
-SAVE_HISTORY_DEFAULT = os.getenv("SAVE_HISTORY_DEFAULT", "true").lower() not in {"0", "false", "no"}
-MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(12 * 1024 * 1024)))
+app = FastAPI(title="ColorScale API", version=VERSION)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 PARAM_ORDER = [
     "alkalinity",
@@ -60,1353 +36,855 @@ PARAM_ORDER = [
     "chloride",
 ]
 
-# Digital RGB targets of the printed template bars, as confirmed by the user.
-TARGET_BARS_RGB: Dict[str, List[int]] = {
-    "gray": [128, 128, 128],
-    "blue": [0, 0, 255],
-    "green": [0, 128, 0],
-    "red": [255, 0, 0],
-}
+WHITE_LIKE_PARAMS = {"iron", "free_chlorine", "aluminium", "copper"}
 
-BAR_ORDER_CANONICAL = ["gray", "blue", "strip", "green", "red"]
-WHITE_LIKE_PARAMS = {"free_chlorine", "nitrate", "copper", "iron", "aluminium"}
-
-# -----------------------------------------------------------------------------
-# FastAPI
-# -----------------------------------------------------------------------------
-
-app = FastAPI(title="ColorScale API", version=APP_VERSION)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+# v0.4.0: espacio cromático canónico aprendido a partir de 38 fotografías
+# válidas sobre la tarjeta de referencia (lotes 2026-06-11 y 2026-07-17).
+# No son los colores de las tiras: son los anclajes reales de la tarjeta impresa.
+ANCHOR_NAMES = ["red", "green", "blue", "gray", "white"]
+NOMINAL_ANCHORS_RGB = np.array(
+    [
+        [255.0, 0.0, 0.0],
+        [0.0, 128.0, 0.0],
+        [0.0, 0.0, 255.0],
+        [128.0, 128.0, 128.0],
+        [255.0, 255.0, 255.0],
+    ],
+    dtype=np.float64,
+)
+CANONICAL_ANCHORS_RGB = np.array(
+    [
+        [208.0, 40.0, 28.0],
+        [50.0, 86.0, 20.0],
+        [63.0, 58.0, 128.0],
+        [129.0, 102.0, 91.0],
+        [188.0, 184.0, 173.0],
+    ],
+    dtype=np.float64,
 )
 
-
-class AnalyzeReq(BaseModel):
-    # Existing frontend-compatible inputs
-    image_url: Optional[str] = None
-    image_base64: Optional[str] = None
-    debug: bool = False
-    client_id: Optional[str] = None
-    scan_id: Optional[str] = None
-
-    # New optional inputs. Defaults preserve the old usage.
-    save_history: Optional[bool] = None
-    operator_id: Optional[str] = None
-    location: Optional[str] = None
+SWATCHES_PATH = os.environ.get("SWATCHES_PATH", "swatches.json")
+MAX_ANALYSIS_DIM = int(os.environ.get("MAX_ANALYSIS_DIM", "1400"))
 
 
-class AnalyzeResponse(BaseModel):
-    # `ok` and `status` are kept as transport/UI compatibility fields for Base44.
-    # A low-quality but completed analysis must not be treated as a proxy error by
-    # the frontend; the real photo-quality verdict is exposed in `photo_status`.
-    ok: bool
-    status: str
-    photo_status: Optional[str] = None
-    quality_score: float = 0.0
-    analysis_id: Optional[str] = None
-    orientation: Optional[str] = None
-    results: List[Dict[str, Any]] = Field(default_factory=list)
-    diagnostics: Dict[str, Any] = Field(default_factory=dict)
-    retake_reason: Optional[str] = None
-    retake_tips: List[str] = Field(default_factory=list)
+def clamp_rgb(rgb: Any) -> np.ndarray:
+    return np.clip(np.asarray(rgb, dtype=np.float64), 0.0, 255.0)
 
 
-_SWATCHES_CACHE: Optional[Dict[str, Any]] = None
-
-
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def check_api_key(x_api_key: str = "") -> None:
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-def load_swatches() -> Dict[str, Any]:
-    global _SWATCHES_CACHE
-    if _SWATCHES_CACHE is not None:
-        return _SWATCHES_CACHE
-    if not SWATCHES_PATH.exists():
-        raise FileNotFoundError(f"swatches file not found: {SWATCHES_PATH}")
-    with SWATCHES_PATH.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    for key in PARAM_ORDER:
-        if key not in data:
-            raise ValueError(f"Missing parameter in swatches.json: {key}")
-        meta = data[key]
-        if "values" not in meta or "rgb" not in meta:
-            raise ValueError(f"Invalid swatches for {key}: expected values and rgb")
-        if len(meta["values"]) != len(meta["rgb"]):
-            raise ValueError(f"Invalid swatches for {key}: values and rgb length differ")
-    _SWATCHES_CACHE = data
-    return data
-
-
-def b64_to_bytes(value: str) -> bytes:
-    # Accept both raw base64 and data URL format.
-    if "," in value and value.lower().startswith("data:"):
-        value = value.split(",", 1)[1]
-    try:
-        return base64.b64decode(value, validate=False)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid image_base64: {exc}") from exc
-
-
-def download_image_bytes(url: str) -> bytes:
-    headers = {
-        "User-Agent": "ColorScale/2.1 (+https://github.com/qlioFactory/colorScale)",
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-    }
-    try:
-        with requests.get(url, timeout=25, headers=headers, verify=certifi.where(), stream=True) as resp:
-            resp.raise_for_status()
-            chunks: List[bytes] = []
-            total = 0
-            for chunk in resp.iter_content(chunk_size=64 * 1024):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > MAX_DOWNLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Image is too large")
-                chunks.append(chunk)
-            return b"".join(chunks)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Cannot download image_url: {exc}") from exc
-
-
-def load_image_from_request(req: AnalyzeReq) -> np.ndarray:
-    if req.image_base64:
-        raw = b64_to_bytes(req.image_base64)
-    elif req.image_url:
-        raw = download_image_bytes(req.image_url)
-    else:
-        raise HTTPException(status_code=400, detail="Provide image_url or image_base64")
-
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise HTTPException(status_code=400, detail="Invalid image content; OpenCV cannot decode it")
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-
-def to_int_list(rgb: Iterable[float]) -> List[int]:
-    return [int(round(float(v))) for v in rgb]
-
-
-def to_float_list(rgb: Iterable[float], digits: int = 1) -> List[float]:
-    return [round(float(v), digits) for v in rgb]
-
-
-def numeric_value(value: Any) -> float:
-    if isinstance(value, (int, float)):
-        return float(value)
-    match = re.search(r"[-+]?\d+(?:\.\d+)?", str(value))
-    return float(match.group(0)) if match else 0.0
-
-
-def smooth_1d(values: np.ndarray, k: int = 31) -> np.ndarray:
-    k = max(3, int(k))
-    if k % 2 == 0:
-        k += 1
-    kernel = np.ones(k, dtype=np.float32) / float(k)
-    return np.convolve(values.astype(np.float32), kernel, mode="same")
-
-
-def robust_patch_stats_rgb(
-    img_rgb: np.ndarray,
-    x0: int,
-    y0: int,
-    x1: int,
-    y1: int,
-    reject_bright_pct: float = 90.0,
-    reject_dark_pct: Optional[float] = 2.0,
-) -> Tuple[np.ndarray, float, float]:
-    """Return median RGB, bright rejected pct and dark rejected pct.
-
-    The median is intentionally used instead of mean to reduce the effect of
-    shadows, printed edges, glare and dust specks.
-    """
-
-    h, w = img_rgb.shape[:2]
-    x0 = max(0, min(w, int(x0)))
-    x1 = max(0, min(w, int(x1)))
-    y0 = max(0, min(h, int(y0)))
-    y1 = max(0, min(h, int(y1)))
-    if x1 <= x0 or y1 <= y0:
-        return np.array([128.0, 128.0, 128.0], dtype=np.float32), 0.0, 0.0
-
-    patch = img_rgb[y0:y1, x0:x1].reshape(-1, 3).astype(np.float32)
-    if len(patch) < 10:
-        return np.median(patch, axis=0).astype(np.float32), 0.0, 0.0
-
-    luminance = 0.2126 * patch[:, 0] + 0.7152 * patch[:, 1] + 0.0722 * patch[:, 2]
-    mask = np.ones(len(patch), dtype=bool)
-
-    bright_rej = 0.0
-    dark_rej = 0.0
-    if reject_bright_pct is not None:
-        hi = np.percentile(luminance, reject_bright_pct)
-        bright_mask = luminance <= hi
-        bright_rej = 100.0 * float(np.sum(~bright_mask)) / float(len(mask))
-        mask &= bright_mask
-    if reject_dark_pct is not None:
-        lo = np.percentile(luminance, reject_dark_pct)
-        dark_mask = luminance >= lo
-        dark_rej = 100.0 * float(np.sum(~dark_mask)) / float(len(mask))
-        mask &= dark_mask
-
-    good = patch[mask]
-    if len(good) < 10:
-        good = patch
-        bright_rej = 0.0
-        dark_rej = 0.0
-    return np.median(good, axis=0).astype(np.float32), float(bright_rej), float(dark_rej)
-
-
-# -----------------------------------------------------------------------------
-# Color math
-# -----------------------------------------------------------------------------
-
-
-def srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
-    x = np.clip(rgb.astype(np.float32) / 255.0, 0.0, 1.0)
+def srgb_to_linear(rgb: Any) -> np.ndarray:
+    x = clamp_rgb(rgb) / 255.0
     return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
 
 
-def linear_to_srgb(lin: np.ndarray) -> np.ndarray:
-    lin = np.clip(lin.astype(np.float32), 0.0, 1.0)
-    x = np.where(lin <= 0.0031308, 12.92 * lin, 1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
-    return np.clip(x * 255.0, 0.0, 255.0).astype(np.float32)
+def linear_to_srgb(lin: Any) -> np.ndarray:
+    x = np.clip(np.asarray(lin, dtype=np.float64), 0.0, 1.0)
+    s = np.where(x <= 0.0031308, 12.92 * x, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
+    return np.clip(s * 255.0, 0.0, 255.0)
 
 
-def fit_per_channel_calibration(measured_refs: Dict[str, np.ndarray]) -> np.ndarray:
-    """Fit per-channel linear calibration in linearized sRGB.
-
-    The result has shape (3, 2): output_linear = slope * input_linear + intercept.
-    This is less aggressive than a full 3x4 RGB affine matrix, so it tends to
-    be more stable for phone photos and printed references.
-    """
-
-    names = ["red", "green", "blue", "gray"]
-    obs = np.array([measured_refs[n] for n in names], dtype=np.float32)
-    tgt = np.array([TARGET_BARS_RGB[n] for n in names], dtype=np.float32)
-    obs_lin = srgb_to_linear(obs)
-    tgt_lin = srgb_to_linear(tgt)
-
-    params = np.zeros((3, 2), dtype=np.float32)
-    for channel in range(3):
-        x = obs_lin[:, channel]
-        y = tgt_lin[:, channel]
-        A = np.vstack([x, np.ones_like(x)]).T
-        sol, *_ = np.linalg.lstsq(A, y, rcond=None)
-        # Limit extreme gains. Bad photos should be flagged, not over-corrected.
-        params[channel, 0] = float(np.clip(sol[0], -3.0, 5.0))
-        params[channel, 1] = float(np.clip(sol[1], -0.6, 0.6))
-    return params
+def fit_diag_affine(obs_rgb: np.ndarray, tgt_rgb: np.ndarray) -> np.ndarray:
+    """Ajuste por canal y = a*x+b en RGB lineal. Devuelve shape (3,2)."""
+    x = srgb_to_linear(obs_rgb)
+    y = srgb_to_linear(tgt_rgb)
+    coeffs = []
+    for c in range(3):
+        a_mat = np.column_stack([x[:, c], np.ones(len(x), dtype=np.float64)])
+        coef, *_ = np.linalg.lstsq(a_mat, y[:, c], rcond=None)
+        coeffs.append(coef)
+    return np.asarray(coeffs, dtype=np.float64)
 
 
-def apply_per_channel_calibration(rgb: np.ndarray, params: np.ndarray) -> np.ndarray:
-    lin = srgb_to_linear(np.asarray(rgb, dtype=np.float32))
-    out_lin = params[:, 0] * lin + params[:, 1]
-    return linear_to_srgb(out_lin)
+def apply_diag_affine(rgb: Any, coeffs: np.ndarray) -> np.ndarray:
+    x = srgb_to_linear(rgb)
+    y = x * coeffs[:, 0] + coeffs[:, 1]
+    return linear_to_srgb(y)
 
 
-def rgb_to_lab_cv(rgb: np.ndarray) -> np.ndarray:
-    # OpenCV LAB for uint8: L 0..255, a/b offset by 128. Convert to standard-ish ranges.
-    arr = np.uint8([[np.clip(np.round(rgb), 0, 255)]])
-    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)[0, 0].astype(np.float32)
-    return np.array([lab[0] * 100.0 / 255.0, lab[1] - 128.0, lab[2] - 128.0], dtype=np.float32)
+NOMINAL_TO_CANONICAL = fit_diag_affine(NOMINAL_ANCHORS_RGB, CANONICAL_ANCHORS_RGB)
 
 
-def delta_e_76(lab1: np.ndarray, lab2: np.ndarray) -> float:
-    return float(np.linalg.norm(lab1.astype(np.float32) - lab2.astype(np.float32)))
+def rgb_to_lab(rgb: Any) -> np.ndarray:
+    arr = np.clip(np.asarray(rgb), 0, 255).astype(np.uint8).reshape(-1, 1, 3)
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float64)
+    lab[:, 0] *= 100.0 / 255.0
+    lab[:, 1] -= 128.0
+    lab[:, 2] -= 128.0
+    return lab
 
 
-def delta_e_2000(lab1: np.ndarray, lab2: np.ndarray) -> float:
-    """CIEDE2000 implementation for one LAB pair."""
-
-    L1, a1, b1 = [float(x) for x in lab1]
-    L2, a2, b2 = [float(x) for x in lab2]
-
-    kL = kC = kH = 1.0
-    C1 = (a1 * a1 + b1 * b1) ** 0.5
-    C2 = (a2 * a2 + b2 * b2) ** 0.5
-    C_bar = (C1 + C2) / 2.0
-    G = 0.5 * (1.0 - (C_bar ** 7 / (C_bar ** 7 + 25.0 ** 7)) ** 0.5) if C_bar > 0 else 0.0
-
-    a1p = (1.0 + G) * a1
-    a2p = (1.0 + G) * a2
-    C1p = (a1p * a1p + b1 * b1) ** 0.5
-    C2p = (a2p * a2p + b2 * b2) ** 0.5
-
-    def hp(ap: float, b: float) -> float:
-        if ap == 0 and b == 0:
-            return 0.0
-        h = np.degrees(np.arctan2(b, ap))
-        return h + 360.0 if h < 0 else h
-
-    h1p = hp(a1p, b1)
-    h2p = hp(a2p, b2)
-
-    dLp = L2 - L1
-    dCp = C2p - C1p
-
-    if C1p * C2p == 0:
-        dhp = 0.0
-    else:
-        dh = h2p - h1p
-        if dh > 180.0:
-            dh -= 360.0
-        elif dh < -180.0:
-            dh += 360.0
-        dhp = dh
-    dHp = 2.0 * (C1p * C2p) ** 0.5 * np.sin(np.radians(dhp / 2.0))
-
-    Lbp = (L1 + L2) / 2.0
-    Cbp = (C1p + C2p) / 2.0
-
-    if C1p * C2p == 0:
-        hbp = h1p + h2p
-    else:
-        dh_abs = abs(h1p - h2p)
-        if dh_abs <= 180.0:
-            hbp = (h1p + h2p) / 2.0
-        elif h1p + h2p < 360.0:
-            hbp = (h1p + h2p + 360.0) / 2.0
-        else:
-            hbp = (h1p + h2p - 360.0) / 2.0
-
-    T = (
-        1.0
-        - 0.17 * np.cos(np.radians(hbp - 30.0))
-        + 0.24 * np.cos(np.radians(2.0 * hbp))
-        + 0.32 * np.cos(np.radians(3.0 * hbp + 6.0))
-        - 0.20 * np.cos(np.radians(4.0 * hbp - 63.0))
-    )
-    delta_theta = 30.0 * np.exp(-(((hbp - 275.0) / 25.0) ** 2))
-    R_C = 2.0 * (Cbp ** 7 / (Cbp ** 7 + 25.0 ** 7)) ** 0.5 if Cbp > 0 else 0.0
-    S_L = 1.0 + (0.015 * ((Lbp - 50.0) ** 2)) / (20.0 + ((Lbp - 50.0) ** 2)) ** 0.5
-    S_C = 1.0 + 0.045 * Cbp
-    S_H = 1.0 + 0.015 * Cbp * T
-    R_T = -np.sin(np.radians(2.0 * delta_theta)) * R_C
-
-    return float(
-        (
-            (dLp / (kL * S_L)) ** 2
-            + (dCp / (kC * S_C)) ** 2
-            + (dHp / (kH * S_H)) ** 2
-            + R_T * (dCp / (kC * S_C)) * (dHp / (kH * S_H))
-        )
-        ** 0.5
-    )
+def delta_e76(rgb1: Any, rgb2: Any) -> float:
+    a = rgb_to_lab(np.asarray(rgb1).reshape(1, 3))[0]
+    b = rgb_to_lab(np.asarray(rgb2).reshape(1, 3))[0]
+    return float(np.linalg.norm(a - b))
 
 
-def delta_e(lab1: np.ndarray, lab2: np.ndarray) -> float:
-    # CIEDE2000 is better perceptually. If any numerical issue happens, fall back to DeltaE76.
+def parse_rgb(value: Any) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        nums = re.findall(r"-?\d+(?:\.\d+)?", value)
+        if len(nums) >= 3:
+            return clamp_rgb([float(nums[0]), float(nums[1]), float(nums[2])])
+        return None
+    if isinstance(value, (list, tuple, np.ndarray)) and len(value) >= 3:
+        return clamp_rgb(value[:3])
+    if isinstance(value, dict):
+        if all(k in value for k in ("r", "g", "b")):
+            return clamp_rgb([value["r"], value["g"], value["b"]])
+        if "rgb" in value:
+            return parse_rgb(value["rgb"])
+    return None
+
+
+def parse_numeric_value(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    m = re.search(r"-?\d+(?:[\.,]\d+)?", str(value))
+    if not m:
+        return float("inf")
     try:
-        return delta_e_2000(lab1, lab2)
+        return float(m.group(0).replace(",", "."))
     except Exception:
-        return delta_e_76(lab1, lab2)
+        return float("inf")
 
 
-def rgb_luminance_chroma(rgb: np.ndarray) -> Tuple[float, float, float]:
-    lab = rgb_to_lab_cv(rgb)
-    L = float(lab[0])
-    chroma = float((lab[1] ** 2 + lab[2] ** 2) ** 0.5)
-    lum_rgb = float(np.mean(rgb))
-    return L, chroma, lum_rgb
+def normalize_swatches(raw: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Tolera los formatos habituales usados en swatches.json."""
+    out: Dict[str, List[Dict[str, Any]]] = {p: [] for p in PARAM_ORDER}
 
-
-# -----------------------------------------------------------------------------
-# Geometry detection
-# -----------------------------------------------------------------------------
-
-
-def find_colored_bar_by_mask(img_rgb: np.ndarray, color: str) -> Tuple[int, int, int, int, float]:
-    h, w = img_rgb.shape[:2]
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-
-    if color == "red":
-        mask = cv2.inRange(hsv, (0, 45, 35), (14, 255, 255)) | cv2.inRange(hsv, (168, 45, 35), (180, 255, 255))
-    elif color == "green":
-        mask = cv2.inRange(hsv, (35, 35, 25), (92, 255, 245))
-    elif color == "blue":
-        mask = cv2.inRange(hsv, (92, 35, 25), (145, 255, 255))
-    elif color == "gray":
-        # Saturation low, medium brightness. The large gray bar is expected near the blue bar.
-        mask = cv2.inRange(hsv, (0, 0, 40), (180, 65, 205))
+    if isinstance(raw, dict):
+        iterable: List[Tuple[str, Any]] = []
+        for key, values in raw.items():
+            if isinstance(values, list):
+                for item in values:
+                    iterable.append((str(key), item))
+            elif isinstance(values, dict):
+                for value_key, item in values.items():
+                    if isinstance(item, dict):
+                        obj = dict(item)
+                        obj.setdefault("value", value_key)
+                        iterable.append((str(key), obj))
+                    else:
+                        iterable.append((str(key), {"value": value_key, "rgb": item}))
+    elif isinstance(raw, list):
+        iterable = []
+        for item in raw:
+            if isinstance(item, dict):
+                param = item.get("parameter") or item.get("param") or item.get("name")
+                if param:
+                    iterable.append((str(param), item))
     else:
-        raise ValueError(f"Unsupported bar color: {color}")
+        iterable = []
 
-    # Remove browser UI and small colored details by requiring a tall vertical rectangle.
-    kernel = np.ones((13, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates: List[Tuple[float, int, int, int, int]] = []
-    for c in cnts:
-        x, y, bw, bh = cv2.boundingRect(c)
-        area = float(bw * bh)
-        if area < max(350.0, 0.0015 * h * w):
-            continue
-        if bh < 0.25 * h:
-            continue
-        if bw <= 0 or bh / max(1, bw) < 3.0:
-            continue
-        # Favor large vertical regions near the center of the photo, not phone/browser UI.
-        center_penalty = 1.0 - min(abs((x + bw / 2.0) - (w / 2.0)) / max(w / 2.0, 1.0), 0.8) * 0.18
-        candidates.append((area * center_penalty, x, y, bw, bh))
-
-    if not candidates:
-        raise ValueError(f"No se detecta la barra {color}")
-
-    score, x, y, bw, bh = max(candidates, key=lambda item: item[0])
-    return int(x), int(y), int(bw), int(bh), float(score)
-
-
-def refine_bar_span_from_column_score(img_rgb: np.ndarray, x_center: int, y0: int, y1: int, mode: str) -> Tuple[int, int]:
-    h, w = img_rgb.shape[:2]
-    x0 = max(0, x_center - 3)
-    x1 = min(w, x_center + 4)
-    col = img_rgb[:, x0:x1].astype(np.float32).mean(axis=1)
-    r, g, b = col[:, 0], col[:, 1], col[:, 2]
-    if mode == "red":
-        score = r - (g + b) / 2.0
-    elif mode == "green":
-        score = g - (r + b) / 2.0
-    elif mode == "blue":
-        score = b - (r + g) / 2.0
-    else:
-        saturation = col.max(axis=1) - col.min(axis=1)
-        luminance = col.mean(axis=1)
-        score = -saturation - 0.15 * np.abs(luminance - 128.0)
-    score = smooth_1d(score, 23)
-
-    # Restrict to the rough contour region first.
-    lo = max(0, int(y0 - 0.08 * h))
-    hi = min(h - 1, int(y1 + 0.08 * h))
-    roi = score[lo:hi]
-    if len(roi) < 5:
-        return int(y0), int(y1)
-    peak_y = int(lo + np.argmax(roi))
-    peak = float(score[peak_y])
-    if mode == "gray":
-        threshold = peak - abs(peak) * 0.30
-        is_inside = lambda v: v >= threshold
-    else:
-        threshold = max(8.0, peak * 0.35)
-        is_inside = lambda v: v >= threshold
-
-    top = peak_y
-    while top > 0 and is_inside(float(score[top])):
-        top -= 1
-    bottom = peak_y
-    while bottom < h - 1 and is_inside(float(score[bottom])):
-        bottom += 1
-    return int(top), int(bottom)
-
-
-def local_edge_peaks(edge_profile: np.ndarray, y_min: int, y_max: int, min_height: float, min_dist: int) -> List[int]:
-    y_min = max(1, y_min)
-    y_max = min(len(edge_profile) - 2, y_max)
-    candidates: List[int] = []
-    for y in range(y_min, y_max):
-        if edge_profile[y] >= edge_profile[y - 1] and edge_profile[y] > edge_profile[y + 1] and edge_profile[y] >= min_height:
-            candidates.append(y)
-    picked: List[int] = []
-    for y in sorted(candidates, key=lambda yy: float(edge_profile[yy]), reverse=True):
-        if all(abs(y - existing) >= min_dist for existing in picked):
-            picked.append(y)
-    return sorted(picked)
-
-
-def _find_peak_span(score: np.ndarray, peak_idx: int, frac: float = 0.55, min_half_width: int = 6) -> Tuple[int, int]:
-    peak = float(score[peak_idx])
-    if peak <= 0:
-        return max(0, peak_idx - min_half_width), min(len(score) - 1, peak_idx + min_half_width)
-    threshold = peak * frac
-    left = int(peak_idx)
-    while left > 0 and score[left] >= threshold:
-        left -= 1
-    right = int(peak_idx)
-    while right < len(score) - 1 and score[right] >= threshold:
-        right += 1
-    if right - left < 2 * min_half_width:
-        left = max(0, peak_idx - min_half_width)
-        right = min(len(score) - 1, peak_idx + min_half_width)
-    return int(left), int(right)
-
-
-def detect_geometry(img_rgb: np.ndarray) -> Dict[str, Any]:
-    h, w = img_rgb.shape[:2]
-
-    # Column-score detection is more robust than contour detection for this template,
-    # because some sample pads can be blue/green/red-ish and may touch the bars after
-    # morphology. We look for the dominant vertical color bands across the usable
-    # central image area.
-    ys0, ys1 = int(h * 0.15), int(h * 0.85)
-    col = img_rgb[ys0:ys1].astype(np.float32).mean(axis=0)
-    r, g, b = col[:, 0], col[:, 1], col[:, 2]
-
-    red_score = smooth_1d(r - (g + b) / 2.0, 41)
-    green_score = smooth_1d(g - (r + b) / 2.0, 41)
-    blue_score = smooth_1d(b - (r + g) / 2.0, 41)
-
-    red_x = int(np.argmax(red_score))
-    green_x = int(np.argmax(green_score))
-    blue_x = int(np.argmax(blue_score))
-
-    if red_score[red_x] < 25 or green_score[green_x] < 15 or blue_score[blue_x] < 20:
-        raise ValueError("No se detectan correctamente las franjas de referencia RGB")
-
-    red_span = _find_peak_span(red_score, red_x, 0.55, 8)
-    green_span = _find_peak_span(green_score, green_x, 0.55, 8)
-    blue_span = _find_peak_span(blue_score, blue_x, 0.55, 8)
-
-    if blue_x < green_x:
-        orientation = "gray-blue-strip-green-red"
-        strip_left = blue_span[1] + 8
-        strip_right = green_span[0] - 8
-        # Empirically the gray bar center is about 0.60-0.70 of the blue-green
-        # center distance to the left of the blue bar in the fixed template.
-        gray_expected_x = int(round(blue_x - 0.63 * abs(green_x - blue_x)))
-    else:
-        orientation = "red-green-strip-blue-gray"
-        strip_left = green_span[1] + 8
-        strip_right = blue_span[0] - 8
-        gray_expected_x = int(round(blue_x + 0.63 * abs(green_x - blue_x)))
-
-    strip_left = max(0, int(strip_left))
-    strip_right = min(w - 1, int(strip_right))
-    if strip_right <= strip_left or strip_right - strip_left < max(16, int(w * 0.015)):
-        raise ValueError("No se pudo aislar la zona de la tira entre las franjas azul y verde")
-
-    # Estimate bar widths from the colored spans. Gray is not saturated, so direct
-    # detection against a white background is less reliable than template geometry.
-    color_bar_w = int(np.median([red_span[1] - red_span[0], green_span[1] - green_span[0], blue_span[1] - blue_span[0]]))
-    color_bar_w = max(12, color_bar_w)
-    gray_span = (max(0, gray_expected_x - color_bar_w // 2), min(w - 1, gray_expected_x + color_bar_w // 2))
-
-    # Refine shared top/bottom of the colored reference bars from vertical color profiles.
-    rough_y0, rough_y1 = ys0, ys1
-    refined_spans = []
-    for name, x in [("blue", blue_x), ("green", green_x), ("red", red_x)]:
-        refined_spans.append(refine_bar_span_from_column_score(img_rgb, x, rough_y0, rough_y1, name))
-    bars_y_top = int(np.median([s[0] for s in refined_spans]))
-    bars_y_bottom = int(np.median([s[1] for s in refined_spans]))
-    if bars_y_bottom - bars_y_top < 0.25 * h:
-        bars_y_top = ys0
-        bars_y_bottom = ys1
-
-    # Rectangles for reference-bar sampling.
-    rects: Dict[str, Tuple[int, int, int, int]] = {
-        "red": (int(red_span[0]), bars_y_top, int(red_span[1] - red_span[0]), int(bars_y_bottom - bars_y_top)),
-        "green": (int(green_span[0]), bars_y_top, int(green_span[1] - green_span[0]), int(bars_y_bottom - bars_y_top)),
-        "blue": (int(blue_span[0]), bars_y_top, int(blue_span[1] - blue_span[0]), int(bars_y_bottom - bars_y_top)),
-        "gray": (int(gray_span[0]), bars_y_top, int(gray_span[1] - gray_span[0]), int(bars_y_bottom - bars_y_top)),
-    }
-    centers_x = {
-        "red": red_x,
-        "green": green_x,
-        "blue": blue_x,
-        "gray": int((gray_span[0] + gray_span[1]) / 2),
+    aliases = {
+        "ph": "pH",
+        "p_h": "pH",
+        "hardness": "gh",
+        "total_hardness": "gh",
+        "freechlorine": "free_chlorine",
+        "free chlorine": "free_chlorine",
+        "nitrate+nitrite": "nitrate",
+        "nitrate_nitrite": "nitrate",
+        "aluminum": "aluminium",
     }
 
-    strip_center_x = int((strip_left + strip_right) / 2)
-    strip_width = int(strip_right - strip_left)
+    for param_raw, item in iterable:
+        pkey = aliases.get(param_raw.strip().lower(), param_raw.strip())
+        if pkey not in out:
+            continue
+        if isinstance(item, dict):
+            rgb = parse_rgb(item.get("rgb") or item.get("color_rgb") or item.get("color"))
+            value = item.get("value")
+            if value is None:
+                value = item.get("label")
+        else:
+            rgb = parse_rgb(item)
+            value = None
+        if rgb is None or value is None:
+            continue
+        can_rgb = apply_diag_affine(rgb.reshape(1, 3), NOMINAL_TO_CANONICAL).reshape(3)
+        out[pkey].append(
+            {
+                "value": value,
+                "rgb": rgb.astype(np.float64),
+                "canonical_rgb": can_rgb.astype(np.float64),
+                "numeric": parse_numeric_value(value),
+            }
+        )
 
-    # Detect top/bottom of the 10 pads using horizontal edge energy around the strip.
-    gray_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    band_half = max(6, int(strip_width * 0.30))
-    band = gray_img[:, max(0, strip_center_x - band_half):min(w, strip_center_x + band_half + 1)]
-    dy = np.abs(np.diff(band, axis=0)).mean(axis=1)
-    edge_profile = smooth_1d(dy, 7)
-    y_min = max(0, bars_y_top - int(0.08 * h))
-    y_max = min(h - 2, bars_y_bottom + int(0.08 * h))
-    min_height = max(3.5, float(np.percentile(edge_profile[y_min:y_max], 90)) * 0.60)
-    peaks = local_edge_peaks(edge_profile, y_min, y_max, min_height=min_height, min_dist=max(10, int((bars_y_bottom - bars_y_top) / 16)))
+    for p in out:
+        out[p].sort(key=lambda x: x["numeric"])
+    return out
 
-    # The physical template fixes the strip stack height to the reference bars.
-    # Edge peaks are useful diagnostics, but in real phone photos they can also
-    # pick up browser UI, sticker shadows or the white handle. For production
-    # sampling we therefore use the calibrated bar vertical span as the pad span.
-    pads_y_top = bars_y_top
-    pads_y_bottom = bars_y_bottom
+
+def load_swatches() -> Dict[str, List[Dict[str, Any]]]:
+    try:
+        with open(SWATCHES_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return normalize_swatches(raw)
+    except Exception:
+        return {p: [] for p in PARAM_ORDER}
+
+
+SWATCHES = load_swatches()
+
+
+def swatches_loaded() -> bool:
+    return all(len(SWATCHES.get(p, [])) > 0 for p in PARAM_ORDER)
+
+
+def resize_for_analysis(img: np.ndarray, max_dim: int = MAX_ANALYSIS_DIM) -> Tuple[np.ndarray, float]:
+    h, w = img.shape[:2]
+    scale = min(1.0, float(max_dim) / float(max(h, w)))
+    if scale < 1.0:
+        img = cv2.resize(img, (int(round(w * scale)), int(round(h * scale))), interpolation=cv2.INTER_AREA)
+    return img, scale
+
+
+def contour_geometry(contour: np.ndarray) -> Dict[str, Any]:
+    pts = contour.reshape(-1, 2).astype(np.float64)
+    center = pts.mean(axis=0)
+    x = pts - center
+    cov = np.cov(x.T)
+    vals, vecs = np.linalg.eigh(cov)
+    axis = vecs[:, int(np.argmax(vals))]
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    perp = np.array([-axis[1], axis[0]], dtype=np.float64)
+    lp = x @ axis
+    sp = x @ perp
+    return {
+        "area": float(cv2.contourArea(contour)),
+        "center": center,
+        "axis": axis,
+        "long": float(lp.max() - lp.min()),
+        "short": float(sp.max() - sp.min()),
+        "contour": contour,
+    }
+
+
+def elongated_components(mask: np.ndarray) -> List[Dict[str, Any]]:
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    result = []
+    for contour in contours:
+        geom = contour_geometry(contour)
+        if geom["area"] < 120:
+            continue
+        if geom["long"] < 40 or geom["short"] < 2:
+            continue
+        if geom["long"] / max(geom["short"], 1e-6) < 4.0:
+            continue
+        result.append(geom)
+    result.sort(key=lambda x: x["area"], reverse=True)
+    return result
+
+
+def sample_binary_line(mask: np.ndarray, origin: np.ndarray, u: np.ndarray, v: np.ndarray,
+                       center_u: float, half_u: float, vv: np.ndarray) -> np.ndarray:
+    us = np.linspace(center_u - half_u, center_u + half_u, 9)
+    uu, vgrid = np.meshgrid(us, vv)
+    map_x = origin[0] + uu * u[0] + vgrid * v[0]
+    map_y = origin[1] + uu * u[1] + vgrid * v[1]
+    sampled = cv2.remap(
+        mask,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return np.mean(sampled > 0, axis=1)
+
+
+def longest_relevant_interval(binary: np.ndarray, center_index: int) -> Optional[Tuple[int, int]]:
+    x = binary.astype(np.uint8).reshape(-1)
+    intervals = []
+    start = None
+    for i, value in enumerate(x):
+        if value and start is None:
+            start = i
+        if start is not None and (not value or i == len(x) - 1):
+            end = i if value and i == len(x) - 1 else i - 1
+            length = end - start + 1
+            mid = (start + end) / 2.0
+            intervals.append((length, start, end, abs(mid - center_index)))
+            start = None
+    if not intervals:
+        return None
+    intervals.sort(key=lambda z: (z[3], -z[0]))
+    _, start, end, _ = intervals[0]
+    return start, end
+
+
+def detect_geometry(img_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
+    img, scale = resize_for_analysis(img_bgr)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    masks = {
+        "red": cv2.inRange(hsv, np.array([0, 65, 50]), np.array([20, 255, 255]))
+               | cv2.inRange(hsv, np.array([165, 65, 50]), np.array([179, 255, 255])),
+        "green": cv2.inRange(hsv, np.array([25, 35, 25]), np.array([105, 255, 255])),
+        "blue": cv2.inRange(hsv, np.array([88, 30, 20]), np.array([170, 255, 255])),
+    }
+    comps = {name: elongated_components(mask) for name, mask in masks.items()}
+
+    best = None
+    for red in comps["red"][:12]:
+        for green in comps["green"][:12]:
+            for blue in comps["blue"][:12]:
+                axes = [red["axis"].copy(), green["axis"].copy(), blue["axis"].copy()]
+                for i in (1, 2):
+                    if np.dot(axes[i], axes[0]) < 0:
+                        axes[i] *= -1
+                parallel = min(abs(float(np.dot(axes[i], axes[j]))) for i in range(3) for j in range(i + 1, 3))
+                if parallel < 0.92:
+                    continue
+
+                v = np.mean(axes, axis=0)
+                v = v / (np.linalg.norm(v) + 1e-12)
+                u = np.array([-v[1], v[0]], dtype=np.float64)
+
+                cr, cg, cb = red["center"], green["center"], blue["center"]
+                if np.dot(cb - cr, u) < 0:
+                    u *= -1
+
+                sr, sg, sb = [float(np.dot(c, u)) for c in (cr, cg, cb)]
+                lr, lg, lb = [float(np.dot(c, v)) for c in (cr, cg, cb)]
+                if not (sr < sg < sb):
+                    continue
+
+                d_rg = sg - sr
+                d_gb = sb - sg
+                if d_rg < 5 or d_gb < 10:
+                    continue
+                ratio = d_gb / d_rg
+                if not (1.3 < ratio < 6.5):
+                    continue
+
+                lengths = np.array([red["long"], green["long"], blue["long"]], dtype=np.float64)
+                align = float(np.std([lr, lg, lb]) / (np.mean(lengths) + 1e-6))
+                len_var = float(np.std(lengths) / (np.mean(lengths) + 1e-6))
+                if align > 0.30 or len_var > 0.45:
+                    continue
+
+                candidate_score = align * 6.0 + len_var * 2.0 + abs(ratio - 2.7) * 0.05
+                if best is None or candidate_score < best[0]:
+                    best = (candidate_score, red, green, blue, u, v)
+
+    if best is None:
+        return None
+
+    score, red, green, blue, u, v = best
+    origin = np.mean([red["center"], green["center"], blue["center"]], axis=0)
+    coords = {}
+    for name, geom in (("red", red), ("green", green), ("blue", blue)):
+        delta = geom["center"] - origin
+        coords[name] = (float(np.dot(delta, u)), float(np.dot(delta, v)))
+
+    h, w = img.shape[:2]
+    corners = np.array([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]], dtype=np.float64)
+    projected = (corners - origin) @ v
+    vv = np.linspace(projected.min(), projected.max(), int(projected.max() - projected.min()) + 1)
+
+    line_scores = []
+    for name, geom in (("red", red), ("green", green), ("blue", blue)):
+        half_u = max(2.5, 0.22 * geom["short"])
+        line_scores.append(sample_binary_line(masks[name], origin, u, v, coords[name][0], half_u, vv))
+
+    combined = np.mean(np.stack(line_scores), axis=0)
+    smooth = np.convolve(combined, np.ones(21) / 21.0, mode="same")
+    good = (smooth > 0.18).astype(np.uint8)
+    close_len = max(15, int(0.03 * len(vv)))
+    good = cv2.morphologyEx(good.reshape(1, -1), cv2.MORPH_CLOSE, np.ones((1, close_len), np.uint8))[0]
+
+    center_v = float(np.mean([coords["red"][1], coords["green"][1], coords["blue"][1]]))
+    center_idx = int(np.argmin(np.abs(vv - center_v)))
+    interval = longest_relevant_interval(good, center_idx)
+
+    if interval is not None:
+        a, b = interval
+        vmin, vmax = float(vv[a]), float(vv[b])
+    else:
+        extents = []
+        for geom in (red, green, blue):
+            vals = (geom["contour"].reshape(-1, 2).astype(np.float64) - origin) @ v
+            extents.append((float(vals.min()), float(vals.max())))
+        vmin = min(x[0] for x in extents)
+        vmax = max(x[1] for x in extents)
+
+    if vmax - vmin < 80:
+        return None
 
     return {
-        "orientation": orientation,
-        "rects": {k: tuple(int(vv) for vv in v) for k, v in rects.items()},
-        "centers_x": {k: int(v) for k, v in centers_x.items()},
-        "strip_left": int(strip_left),
-        "strip_right": int(strip_right),
-        "strip_center_x": int(strip_center_x),
-        "strip_width": int(strip_width),
-        "bars_y_top": int(bars_y_top),
-        "bars_y_bottom": int(bars_y_bottom),
-        "pads_y_top": int(pads_y_top),
-        "pads_y_bottom": int(pads_y_bottom),
-        "edge_peaks_count": len(peaks),
-        "edge_peaks": [int(v) for v in peaks[:20]],
+        "img": img,
+        "scale": scale,
+        "score": float(score),
+        "red": red,
+        "green": green,
+        "blue": blue,
+        "u": u,
+        "v": v,
+        "origin": origin,
+        "coords": coords,
+        "vmin": vmin,
+        "vmax": vmax,
     }
 
-def sample_bar_color(img_rgb: np.ndarray, rect: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float, float]:
-    x, y, w, h = rect
-    # Use the central portion only, avoiding borders and shadows.
-    mx = max(2, int(w * 0.22))
-    my = max(8, int(h * 0.18))
-    return robust_patch_stats_rgb(img_rgb, x + mx, y + my, x + w - mx, y + h - my, reject_bright_pct=92.0, reject_dark_pct=2.0)
+
+def sample_oriented_rect(img_bgr: np.ndarray, origin: np.ndarray, u: np.ndarray, v: np.ndarray,
+                         center_u: float, center_v: float, half_u: float, half_v: float,
+                         nu: int = 19, nv: int = 19) -> np.ndarray:
+    us = np.linspace(center_u - half_u, center_u + half_u, nu)
+    vs = np.linspace(center_v - half_v, center_v + half_v, nv)
+    uu, vv = np.meshgrid(us, vs)
+    map_x = origin[0] + uu * u[0] + vv * v[0]
+    map_y = origin[1] + uu * u[1] + vv * v[1]
+    bgr = cv2.remap(
+        img_bgr,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT,
+    )
+    return bgr[:, :, ::-1]
 
 
-def sample_pad_rects(geom: Dict[str, Any]) -> List[Tuple[int, int, int, int, int, int]]:
-    strip_left = int(geom["strip_left"])
-    strip_right = int(geom["strip_right"])
-    strip_center_x = int(geom["strip_center_x"])
-    strip_width = max(10, int(strip_right - strip_left))
-    pads_top = int(geom["pads_y_top"])
-    pads_bottom = int(geom["pads_y_bottom"])
-    span = max(20, pads_bottom - pads_top)
-    pitch = span / 10.0
-
-    # Samples should be small and central to avoid pad borders, glue, shadows and the plastic separator.
-    sample_w = max(7, min(24, int(strip_width * 0.42)))
-    sample_h = max(7, min(20, int(pitch * 0.32)))
-
-    rects: List[Tuple[int, int, int, int, int, int]] = []
-    for i, param in enumerate(PARAM_ORDER):
-        cy = int(round(pads_top + (i + 0.5) * pitch))
-        cx = strip_center_x
-
-        # The last pad is usually close to the white handle; lift slightly to avoid the handle boundary.
-        if param == "chloride":
-            cy = int(round(cy - 0.10 * pitch))
-
-        # The white/very pale tests are particularly sensitive to border shadows.
-        w = sample_w
-        h = sample_h
-        if param in WHITE_LIKE_PARAMS:
-            w = max(6, int(w * 0.85))
-            h = max(6, int(h * 0.85))
-        rects.append((int(cx - w / 2), int(cy - h / 2), int(w), int(h), int(cx), int(cy)))
-    return rects
+def robust_patch_stats_rgb(patch_rgb: np.ndarray, reject_top: float = 0.12,
+                           reject_bottom: float = 0.02) -> Tuple[np.ndarray, float]:
+    pixels = patch_rgb.reshape(-1, 3).astype(np.float64)
+    lum = 0.2126 * pixels[:, 0] + 0.7152 * pixels[:, 1] + 0.0722 * pixels[:, 2]
+    lo = np.quantile(lum, reject_bottom) if reject_bottom > 0 else -1.0
+    hi = np.quantile(lum, 1.0 - reject_top) if reject_top > 0 else 256.0
+    keep = (lum >= lo) & (lum <= hi)
+    if np.sum(keep) < max(10, int(0.30 * len(pixels))):
+        keep[:] = True
+    rgb = np.median(pixels[keep], axis=0)
+    rejected = 100.0 * (1.0 - float(np.sum(keep)) / float(len(pixels)))
+    return clamp_rgb(rgb), rejected
 
 
-def estimate_local_blank_rgb(
-    img_rgb: np.ndarray,
-    sample_rects: List[Tuple[int, int, int, int, int, int]],
-    index: int,
-    raw_rgb: np.ndarray,
-) -> Optional[np.ndarray]:
-    """Estimate the local unreacted strip/background color near a pad.
+def strip_profile(geometry: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    img = geometry["img"]
+    u, v, origin = geometry["u"], geometry["v"], geometry["origin"]
+    ug = geometry["coords"]["green"][0]
+    ub = geometry["coords"]["blue"][0]
+    center_u = (ug + ub) / 2.0
+    gap = ub - ug
+    length = geometry["vmax"] - geometry["vmin"]
 
-    White/pale reagents on the Redmi photos are often photographed as beige or
-    grey due to exposure, shadows and plastic glare. Sampling the blank strip
-    immediately above/below the pad lets us tell apart a real chemical color
-    change from the same warm/dark cast affecting the whole strip.
-    """
+    vv = np.linspace(
+        geometry["vmin"] - 0.08 * length,
+        geometry["vmax"] + 0.08 * length,
+        int(length * 1.16) + 1,
+    )
+    us = np.linspace(center_u - 0.12 * gap, center_u + 0.12 * gap, 21)
+    uu, vgrid = np.meshgrid(us, vv)
+    map_x = origin[0] + uu * u[0] + vgrid * v[0]
+    map_y = origin[1] + uu * u[1] + vgrid * v[1]
+    bgr = cv2.remap(
+        img,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT,
+    )
+    rgb = bgr[:, :, ::-1]
+    median_rgb = np.median(rgb, axis=1)
+    lab = rgb_to_lab(median_rgb)
+    chroma = np.sqrt(lab[:, 1] ** 2 + lab[:, 2] ** 2)
+    chroma = np.convolve(chroma, np.ones(9) / 9.0, mode="same")
+    dif = np.linalg.norm(np.diff(lab, axis=0), axis=1)
+    edge = np.r_[dif[0] if len(dif) else 0.0, dif]
+    edge = np.convolve(edge, np.ones(7) / 7.0, mode="same")
+    return vv, chroma, edge
 
-    if index < 0 or index >= len(sample_rects):
-        return None
 
-    x, y, w, h, cx, cy = sample_rects[index]
-    candidates: List[np.ndarray] = []
+def detect_pad_centers(geometry: Dict[str, Any]) -> Tuple[np.ndarray, float, float]:
+    """Busca una rejilla regular de 10 pads; no depende del borde exacto del primer pad."""
+    vv, chroma, edge = strip_profile(geometry)
+    length = geometry["vmax"] - geometry["vmin"]
 
-    # Gaps between neighbouring pads are blank strip. Sample both adjacent gaps
-    # and keep the one most similar to the current pad; this avoids using a gap
-    # contaminated by the previous/next coloured reagent.
-    for upper_idx, lower_idx in ((index - 1, index), (index, index + 1)):
-        if upper_idx < 0 or lower_idx >= len(sample_rects):
-            continue
-        ux, uy, uw, uh, ucx, ucy = sample_rects[upper_idx]
-        lx, ly, lw, lh, lcx, lcy = sample_rects[lower_idx]
-        gap_top = int(uy + uh)
-        gap_bottom = int(ly)
-        gap_h = gap_bottom - gap_top
-        if gap_h < max(6, int(h * 0.45)):
-            continue
+    best_score = -1e18
+    best_centers = None
+    best_pitch = None
 
-        gy0 = int(gap_top + 0.22 * gap_h)
-        gy1 = int(gap_bottom - 0.22 * gap_h)
-        gx0 = int(cx - max(5, w * 0.45))
-        gx1 = int(cx + max(5, w * 0.45))
-        rgb, _bright, _dark = robust_patch_stats_rgb(
-            img_rgb, gx0, gy0, gx1, gy1, reject_bright_pct=92.0, reject_dark_pct=2.0
+    # 61 x 81 ~= 5.000 combinaciones: rápido y estable en Cloud Run.
+    pitches = np.linspace(0.085 * length, 0.105 * length, 61)
+    first_centers = np.linspace(geometry["vmin"], geometry["vmin"] + 0.14 * length, 81)
+
+    for pitch in pitches:
+        boundary_offset = 0.31 * pitch
+        for first in first_centers:
+            centers = first + np.arange(10, dtype=np.float64) * pitch
+            if centers[-1] > geometry["vmax"] + 0.08 * length:
+                continue
+
+            idx = np.clip(np.searchsorted(vv, centers), 0, len(vv) - 1)
+            gaps = (centers[:-1] + centers[1:]) / 2.0
+            gap_idx = np.clip(np.searchsorted(vv, gaps), 0, len(vv) - 1)
+            b1 = np.clip(np.searchsorted(vv, centers - boundary_offset), 0, len(vv) - 1)
+            b2 = np.clip(np.searchsorted(vv, centers + boundary_offset), 0, len(vv) - 1)
+
+            score = float(np.sum(chroma[idx]) - 0.65 * np.sum(chroma[gap_idx]))
+            score += 0.45 * float(np.sum(edge[b1]) + np.sum(edge[b2]))
+            score -= 0.20 * float(np.sum(edge[idx]))
+
+            if score > best_score:
+                best_score = score
+                best_centers = centers.copy()
+                best_pitch = float(pitch)
+
+    if best_centers is None:
+        raise ValueError("No se ha podido localizar la rejilla de 10 pads")
+
+    return best_centers, float(best_pitch), float(best_score)
+
+
+def sample_reference_anchors(geometry: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    img = geometry["img"]
+    u, v, origin = geometry["u"], geometry["v"], geometry["origin"]
+    coords = geometry["coords"]
+    length = geometry["vmax"] - geometry["vmin"]
+    center_v = (geometry["vmin"] + geometry["vmax"]) / 2.0
+
+    anchors = {}
+    for name in ("red", "green", "blue"):
+        geom = geometry[name]
+        patch = sample_oriented_rect(
+            img, origin, u, v,
+            coords[name][0], center_v,
+            max(2.0, 0.18 * geom["short"]), 0.30 * length,
+            15, 81,
         )
-        candidates.append(rgb)
+        anchors[name], _ = robust_patch_stats_rgb(patch, 0.10, 0.02)
 
-    if not candidates:
+    d_rg = coords["green"][0] - coords["red"][0]
+    median_short = float(np.median([geometry["red"]["short"], geometry["green"]["short"], geometry["blue"]["short"]]))
+
+    gray_u = coords["blue"][0] + 0.95 * d_rg
+    patch = sample_oriented_rect(
+        img, origin, u, v,
+        gray_u, center_v,
+        max(2.0, 0.18 * median_short), 0.30 * length,
+        15, 81,
+    )
+    anchors["gray"], _ = robust_patch_stats_rgb(patch, 0.10, 0.02)
+
+    white_u = coords["red"][0] - 0.95 * d_rg
+    patch = sample_oriented_rect(
+        img, origin, u, v,
+        white_u, center_v,
+        max(3.0, 0.22 * d_rg), 0.20 * length,
+        15, 61,
+    )
+    anchors["white"], _ = robust_patch_stats_rgb(patch, 0.12, 0.02)
+    return anchors
+
+
+def sample_pads(geometry: Dict[str, Any], centers_v: np.ndarray, pitch: float) -> Tuple[np.ndarray, List[float], List[List[int]]]:
+    img = geometry["img"]
+    u, v, origin = geometry["u"], geometry["v"], geometry["origin"]
+    ug = geometry["coords"]["green"][0]
+    ub = geometry["coords"]["blue"][0]
+    center_u = (ug + ub) / 2.0
+    gap = ub - ug
+
+    rgbs = []
+    glare = []
+    points = []
+    for center_v in centers_v:
+        patch = sample_oriented_rect(
+            img, origin, u, v,
+            center_u, float(center_v),
+            0.13 * gap, 0.20 * pitch,
+            19, 19,
+        )
+        rgb, rejected = robust_patch_stats_rgb(patch, 0.12, 0.02)
+        rgbs.append(rgb)
+        glare.append(float(rejected))
+        p = origin + center_u * u + float(center_v) * v
+        points.append([int(round(float(p[0] / geometry["scale"]))), int(round(float(p[1] / geometry["scale"])))])
+
+    return np.asarray(rgbs, dtype=np.float64), glare, points
+
+
+def nearest_match(param: str, rgb: np.ndarray, space: str) -> Dict[str, Any]:
+    items = SWATCHES.get(param, [])
+    if not items:
+        return {"item": None, "delta": 999.0, "delta2": 999.0, "ratio": 1.0}
+
+    key = "canonical_rgb" if space == "canonical" else "rgb"
+    distances = [(delta_e76(rgb, item[key]), item) for item in items]
+    distances.sort(key=lambda x: x[0])
+    d1, best = distances[0]
+    d2 = distances[1][0] if len(distances) > 1 else d1 + 20.0
+    ratio = float(d1 / max(d2, 1e-6))
+    return {"item": best, "delta": float(d1), "delta2": float(d2), "ratio": ratio}
+
+
+def orientation_score(raw_seq: np.ndarray, canonical_seq: np.ndarray) -> float:
+    score = 0.0
+    weights = [1.25, 1.25, 1.25, 1.0, 1.0, 1.0, 1.0, 1.0, 1.15, 1.15]
+    for i, param in enumerate(PARAM_ORDER):
+        mr = nearest_match(param, raw_seq[i], "raw")
+        mc = nearest_match(param, canonical_seq[i], "canonical")
+        # Usamos el espacio que mejor explica el color para decidir solo la orientación.
+        local = min(mr["delta"], mc["delta"])
+        local += 4.0 * min(mr["ratio"], mc["ratio"])
+        score += weights[i] * min(local, 45.0)
+    return float(score)
+
+
+def choose_orientation(raw_seq: np.ndarray, canonical_seq: np.ndarray,
+                       points: List[List[int]], glare: List[float]) -> Tuple[np.ndarray, np.ndarray, List[List[int]], List[float], str, float, float]:
+    forward = orientation_score(raw_seq, canonical_seq)
+    reverse = orientation_score(raw_seq[::-1], canonical_seq[::-1])
+    if reverse + 1.0 < forward:
+        return raw_seq[::-1], canonical_seq[::-1], points[::-1], glare[::-1], "reversed", reverse, forward
+    return raw_seq, canonical_seq, points, glare, "forward", forward, reverse
+
+
+def relative_neutrality(rgb: np.ndarray, white_rgb: np.ndarray) -> Tuple[float, float]:
+    rgb = clamp_rgb(rgb)
+    white_rgb = clamp_rgb(white_rgb)
+    lum = float(0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2])
+    wlum = float(0.2126 * white_rgb[0] + 0.7152 * white_rgb[1] + 0.0722 * white_rgb[2])
+    ratio = lum / max(wlum, 1.0)
+    chroma = float(np.max(rgb) - np.min(rgb))
+    return ratio, chroma
+
+
+def force_low_if_neutral(param: str, raw_rgb: np.ndarray, white_rgb: np.ndarray) -> Optional[Dict[str, Any]]:
+    if param not in WHITE_LIKE_PARAMS:
         return None
-
-    raw_lab = rgb_to_lab_cv(raw_rgb)
-    def score(candidate: np.ndarray) -> float:
-        cand_lab = rgb_to_lab_cv(candidate)
-        # Prefer a nearby blank with similar luminance/chroma to the pad.
-        return delta_e(raw_lab, cand_lab)
-
-    candidates = sorted(candidates, key=score)
-    return candidates[0].astype(np.float32)
-
-
-# -----------------------------------------------------------------------------
-# Matching and status
-# -----------------------------------------------------------------------------
+    items = SWATCHES.get(param, [])
+    if not items:
+        return None
+    ratio, chroma = relative_neutrality(raw_rgb, white_rgb)
+    ordered = sorted(items, key=lambda x: x["numeric"])
+    if ratio >= 0.90 and chroma <= 30:
+        return ordered[0]
+    return None
 
 
-def classify_result(param: str, numeric: float, meta: Dict[str, Any]) -> str:
-    danger = meta.get("danger") or []
-    recommended = meta.get("recommended") or []
+def choose_match(param: str, raw_rgb: np.ndarray, canonical_rgb: np.ndarray,
+                 white_rgb: np.ndarray) -> Tuple[Dict[str, Any], str, Dict[str, Any], Dict[str, Any]]:
+    forced = force_low_if_neutral(param, raw_rgb, white_rgb)
+    raw_match = nearest_match(param, raw_rgb, "raw")
+    can_match = nearest_match(param, canonical_rgb, "canonical")
 
-    # Values printed in red in the PDF are maximum limits. When a danger limit is
-    # given, values at or above that limit are classified as peligro.
-    if danger:
-        threshold = min(float(v) for v in danger)
-        if numeric >= threshold:
-            return "peligro"
+    if forced is not None:
+        return forced, "neutral-low", raw_match, can_match
 
-    if len(recommended) == 2:
-        lo, hi = float(recommended[0]), float(recommended[1])
-        if lo <= numeric <= hi:
-            return "ok"
-        return "fuera_de_rango"
+    if raw_match["item"] is None:
+        return can_match["item"], "canonical", raw_match, can_match
+    if can_match["item"] is None:
+        return raw_match["item"], "raw", raw_match, can_match
 
-    return "ok"
+    raw_value = str(raw_match["item"]["value"])
+    can_value = str(can_match["item"]["value"])
+    if raw_value == can_value:
+        return can_match["item"], "agree", raw_match, can_match
+
+    # La decisión se basa principalmente en separación relativa frente al segundo swatch.
+    # La calibración canónica solo gana si la evidencia es suficientemente clara.
+    if can_match["ratio"] + 0.08 < raw_match["ratio"]:
+        return can_match["item"], "canonical", raw_match, can_match
+    if can_match["delta"] + 3.0 < raw_match["delta"] and can_match["ratio"] <= raw_match["ratio"] + 0.03:
+        return can_match["item"], "canonical", raw_match, can_match
+    return raw_match["item"], "raw", raw_match, can_match
 
 
-def confidence_from_distances(best: float, second: float, quality_score: float) -> str:
-    gap = max(0.0, second - best)
-    if quality_score < 0.38:
-        return "low"
-    if best <= 6.0 and gap >= 2.0:
-        return "high"
-    if best <= 12.0 and gap >= 1.5:
+def confidence_for(raw_match: Dict[str, Any], can_match: Dict[str, Any], mode: str) -> str:
+    if mode == "neutral-low":
         return "medium"
-    if best <= 18.0 and gap >= 3.0:
+    agree = (
+        raw_match.get("item") is not None
+        and can_match.get("item") is not None
+        and str(raw_match["item"]["value"]) == str(can_match["item"]["value"])
+    )
+    best_ratio = min(float(raw_match.get("ratio", 1.0)), float(can_match.get("ratio", 1.0)))
+    best_delta = min(float(raw_match.get("delta", 999.0)), float(can_match.get("delta", 999.0)))
+    if agree and best_ratio <= 0.70 and best_delta <= 16:
+        return "high"
+    if agree or (best_ratio <= 0.78 and best_delta <= 22):
         return "medium"
     return "low"
 
 
-def build_swatch_distances(rgb: np.ndarray, meta: Dict[str, Any]) -> List[Tuple[float, int]]:
-    lab = rgb_to_lab_cv(rgb)
-    distances: List[Tuple[float, int]] = []
-    for idx, ref_rgb in enumerate(meta["rgb"]):
-        ref_lab = rgb_to_lab_cv(np.array(ref_rgb, dtype=np.float32))
-        distances.append((delta_e(lab, ref_lab), idx))
-    return sorted(distances, key=lambda x: x[0])
+def decode_image_payload(payload: Dict[str, Any]) -> np.ndarray:
+    image_url = payload.get("image_url") or payload.get("imageUrl") or payload.get("url")
+    image_b64 = payload.get("image_base64") or payload.get("imageBase64")
 
-
-def build_weighted_lab_distances(rgb: np.ndarray, meta: Dict[str, Any], lightness_weight: float = 0.18) -> List[Tuple[float, int]]:
-    """
-    Distance for very pale reagents.
-
-    For white/pale pads, phone exposure and shadows change L* much more than the
-    useful chemical signal. Comparing a,b* with reduced L* weight prevents a
-    neutral grey/white pad photographed under low light from being interpreted as
-    a high pink/yellow concentration.
-    """
-    lab = rgb_to_lab_cv(rgb)
-    distances: List[Tuple[float, int]] = []
-    for idx, ref_rgb in enumerate(meta["rgb"]):
-        ref_lab = rgb_to_lab_cv(np.array(ref_rgb, dtype=np.float32))
-        d = lab - ref_lab
-        weighted = float(np.sqrt((lightness_weight * d[0]) ** 2 + d[1] ** 2 + d[2] ** 2))
-        distances.append((weighted, idx))
-    return sorted(distances, key=lambda x: x[0])
-
-
-def match_swatch(
-    param: str,
-    raw_rgb: np.ndarray,
-    cal_rgb: np.ndarray,
-    meta: Dict[str, Any],
-    prefer_raw: bool = False,
-    local_blank_rgb: Optional[np.ndarray] = None,
-) -> Dict[str, Any]:
-    raw_distances = build_swatch_distances(raw_rgb, meta)
-    cal_distances = build_swatch_distances(cal_rgb, meta)
-
-    cal_clip_count = int(np.sum((cal_rgb <= 2) | (cal_rgb >= 253)))
-    raw_best, raw_idx = raw_distances[0]
-    cal_best, cal_idx = cal_distances[0]
-
-    L_cal, chroma_cal, lum_cal = rgb_luminance_chroma(cal_rgb)
-    L_raw, chroma_raw, lum_raw = rgb_luminance_chroma(raw_rgb)
-
-    # Pale/white reagent pads are the most sensitive to shadows and camera
-    # exposure. Do not use the saturated-bar calibration for these pads because
-    # it can inject a magenta/blue cast when the four reference bars do not fit a
-    # single RGB linear model. Instead, match mostly by hue/chroma and force truly
-    # neutral pads to the lowest concentration.
-    if param in WHITE_LIKE_PARAMS:
-        numeric_values = meta.get("numeric_values") or [numeric_value(v) for v in meta["values"]]
-        lowest_idx = int(np.argmin(np.array(numeric_values, dtype=np.float32)))
-        weighted_raw = build_weighted_lab_distances(raw_rgb, meta, lightness_weight=0.16)
-        mode = "raw_white_weighted_lab"
-        distances = weighted_raw
-        used_rgb = raw_rgb
-
-        local_blank_delta: Optional[float] = None
-        if local_blank_rgb is not None:
-            local_blank_delta = delta_e(rgb_to_lab_cv(raw_rgb), rgb_to_lab_cv(local_blank_rgb))
-
-        def force_lowest(base_distances: List[Tuple[float, int]]) -> List[Tuple[float, int]]:
-            actual_lowest = next((float(d) for d, idx in base_distances if idx == lowest_idx), float(base_distances[0][0]))
-            best_any = float(base_distances[0][0])
-            # Make the lowest concentration win, but keep the reported distance
-            # close to the real competing match so confidence does not become
-            # artificially high.
-            forced = max(0.01, min(actual_lowest, best_any) - 0.01)
-            return [(forced, lowest_idx)] + [(float(d), int(idx)) for d, idx in base_distances if idx != lowest_idx]
-
-        # If the pad color is almost the same as the nearby blank strip, this is
-        # not a real reagent color change. This is the main Redmi 9 fix for
-        # copper/iron/pale pads photographed as beige by the camera.
-        local_thresholds = {
-            "free_chlorine": 11.0,
-            "nitrate": 8.5,
-            "copper": 8.5,
-            "iron": 11.0,
-            "aluminium": 7.0,
-        }
-        if local_blank_delta is not None and local_blank_delta <= local_thresholds.get(param, 8.0):
-            distances = force_lowest(weighted_raw)
-            mode = "raw_white_local_blank_bias"
-
-        # Chlorine/nitrate positives are pink/magenta. A warm beige/grey cast from
-        # light or plastic should still be treated as zero.
-        elif param in {"free_chlorine", "nitrate"} and L_raw >= 45.0 and raw_best <= 35.0:
-            lab_raw = rgb_to_lab_cv(raw_rgb)
-            if float(lab_raw[1]) < 10.0 and float(lab_raw[2]) > 0.0:
-                distances = force_lowest(weighted_raw)
-                mode = "raw_white_non_pink_bias"
-
-        elif L_raw >= 45.0 and chroma_raw <= 8.0:
-            distances = force_lowest(weighted_raw)
-            mode = "raw_white_neutral_bias"
-
-        # If the image is genuinely bright and calibration did not distort the
-        # color, allow the old bright-white guard as a secondary path.
-        elif not prefer_raw and cal_clip_count < 2 and L_cal >= 91.0 and chroma_cal <= 7.0:
-            distances = [(cal_distances[0][0], lowest_idx)] + [(d, idx) for d, idx in cal_distances if idx != lowest_idx]
-            mode = "calibrated_white_bright_bias"
-            used_rgb = cal_rgb
-
+    if image_url:
+        response = requests.get(str(image_url), timeout=25, verify=certifi.where())
+        response.raise_for_status()
+        data = np.frombuffer(response.content, dtype=np.uint8)
+    elif image_b64:
+        text = str(image_b64)
+        if "," in text and text.lstrip().startswith("data:"):
+            text = text.split(",", 1)[1]
+        data = np.frombuffer(base64.b64decode(text), dtype=np.uint8)
     else:
-        # Default to calibrated color only when the reference-bar calibration is
-        # internally reliable. If the reference residuals are high, full
-        # calibration is more likely to over-correct than help, so use raw RGB.
-        mode = "calibrated"
-        distances = cal_distances
-        used_rgb = cal_rgb
+        raise ValueError("Falta image_url/imageUrl o image_base64")
 
-        if prefer_raw:
-            mode = "raw_unreliable_calibration"
-            distances = raw_distances
-            used_rgb = raw_rgb
-        elif cal_clip_count >= 2 and raw_best + 3.0 < cal_best:
-            mode = "raw_clip_fallback"
-            distances = raw_distances
-            used_rgb = raw_rgb
-
-    distances = sorted(distances, key=lambda x: x[0])
-    best, idx = distances[0]
-    second = distances[1][0] if len(distances) > 1 else 99.0
-    value = meta["values"][idx]
-    numeric = (meta.get("numeric_values") or [numeric_value(v) for v in meta["values"]])[idx]
-
-    return {
-        "index": int(idx),
-        "value": value,
-        "numeric_value": float(numeric),
-        "reference_rgb": meta["rgb"][idx],
-        "deltaE": float(best),
-        "deltaE2": float(second),
-        "mode": mode,
-        "used_rgb": used_rgb,
-    }
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("No se ha podido decodificar la imagen")
+    return img
 
 
-# -----------------------------------------------------------------------------
-# History storage
-# -----------------------------------------------------------------------------
-
-
-def init_history_db() -> None:
-    try:
-        HISTORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(HISTORY_DB_PATH) as con:
-            con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS analyses (
-                    id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    client_id TEXT,
-                    scan_id TEXT,
-                    operator_id TEXT,
-                    location TEXT,
-                    status TEXT NOT NULL,
-                    quality_score REAL NOT NULL,
-                    result_json TEXT NOT NULL
-                )
-                """
-            )
-            con.execute("CREATE INDEX IF NOT EXISTS idx_analyses_created_at ON analyses(created_at DESC)")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_analyses_client_id ON analyses(client_id)")
-            con.commit()
-    except Exception:
-        # Do not fail app startup if DB is read-only. The endpoint will return analysis without history.
-        pass
-
-
-def save_analysis(req: AnalyzeReq, result: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    analysis_id = str(uuid.uuid4())
-    try:
-        HISTORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(HISTORY_DB_PATH) as con:
-            con.execute(
-                """
-                INSERT INTO analyses
-                (id, created_at, client_id, scan_id, operator_id, location, status, quality_score, result_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    analysis_id,
-                    utc_now_iso(),
-                    req.client_id,
-                    req.scan_id,
-                    req.operator_id,
-                    req.location,
-                    result.get("status", "unknown"),
-                    float(result.get("quality_score", 0.0)),
-                    json.dumps(result, ensure_ascii=False),
-                ),
-            )
-            con.commit()
-        return analysis_id, None
-    except Exception as exc:
-        return None, str(exc)
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_history_db()
-
-
-# -----------------------------------------------------------------------------
-# Core analysis
-# -----------------------------------------------------------------------------
-
-
-def _analyze_image_impl(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
-    swatches = load_swatches()
-    h, w = img_rgb.shape[:2]
-    geom = detect_geometry(img_rgb)
-
-    measured_refs: Dict[str, np.ndarray] = {}
-    bar_rejections: Dict[str, Dict[str, float]] = {}
-    for name in ["gray", "blue", "green", "red"]:
-        rgb, bright_rej, dark_rej = sample_bar_color(img_rgb, geom["rects"][name])
-        measured_refs[name] = rgb
-        bar_rejections[name] = {
-            "brightRejectedPct": round(float(bright_rej), 2),
-            "darkRejectedPct": round(float(dark_rej), 2),
+def analyze_image(img_bgr: np.ndarray) -> Dict[str, Any]:
+    if not swatches_loaded():
+        return {
+            "ok": False,
+            "version": VERSION,
+            "foundBars": False,
+            "error": "swatches.json no contiene todos los parámetros esperados",
         }
 
-    cal_params = fit_per_channel_calibration(measured_refs)
+    geometry = detect_geometry(img_bgr)
+    if geometry is None:
+        return {
+            "ok": True,
+            "version": VERSION,
+            "foundBars": False,
+            "retake": True,
+            "retakeReason": "No se han detectado con suficiente claridad las barras de referencia.",
+            "warnings": [],
+            "results": [],
+        }
 
-    def calibrate(rgb: np.ndarray) -> np.ndarray:
-        return apply_per_channel_calibration(rgb, cal_params)
+    centers_v, pitch, grid_score = detect_pad_centers(geometry)
+    anchors = sample_reference_anchors(geometry)
+    anchor_matrix = np.stack([anchors[name] for name in ANCHOR_NAMES])
+    calibration = fit_diag_affine(anchor_matrix, CANONICAL_ANCHORS_RGB)
 
-    # Reference calibration residual. This cannot be zero with per-channel model,
-    # which is good: it still detects unstable photos.
-    ref_errors_de: Dict[str, float] = {}
-    ref_corrected: Dict[str, List[int]] = {}
-    for name, observed in measured_refs.items():
-        corrected = calibrate(observed)
-        ref_corrected[name] = to_int_list(corrected)
-        ref_errors_de[name] = round(delta_e(rgb_to_lab_cv(corrected), rgb_to_lab_cv(np.array(TARGET_BARS_RGB[name], dtype=np.float32))), 2)
+    corrected_anchors = apply_diag_affine(anchor_matrix, calibration)
+    anchor_errors = np.array(
+        [delta_e76(corrected_anchors[i], CANONICAL_ANCHORS_RGB[i]) for i in range(len(ANCHOR_NAMES))],
+        dtype=np.float64,
+    )
+    cal_mean = float(np.mean(anchor_errors))
+    cal_max = float(np.max(anchor_errors))
 
-    ref_error_mean = float(np.mean(list(ref_errors_de.values())))
-    ref_error_max = float(np.max(list(ref_errors_de.values())))
+    raw_seq, glare, points = sample_pads(geometry, centers_v, pitch)
+    canonical_seq = apply_diag_affine(raw_seq, calibration)
 
-    # If the four reference bars cannot be mapped to their target colors with a
-    # low residual, do not force that calibration onto the chemical pads. This
-    # happens with some Android photos, printed/laminated templates or uneven
-    # warm light. Geometry can still be valid, so continue with conservative raw
-    # matching rather than failing the scan.
-    prefer_raw_matching = bool(ref_error_mean > 16.0 or ref_error_max > 32.0)
+    raw_seq, canonical_seq, points, glare, orientation, orientation_score_used, orientation_score_other = choose_orientation(
+        raw_seq, canonical_seq, points, glare
+    )
 
-    sample_rects = sample_pad_rects(geom)
-    results: List[Dict[str, Any]] = []
-    match_errors: List[float] = []
-    warnings: List[str] = []
-    low_conf_count = 0
+    warnings = []
+    if geometry["score"] > 1.0:
+        warnings.append("La geometría de la tarjeta es menos nítida de lo habitual.")
+    if cal_mean > 10.0 or cal_max > 20.0:
+        warnings.append("La iluminación es irregular; se ha aplicado corrección con la tarjeta de referencia.")
+    if abs(orientation_score_other - orientation_score_used) < 6.0:
+        warnings.append("La orientación de la tira es poco concluyente.")
 
-    for i, (param, sample) in enumerate(zip(PARAM_ORDER, sample_rects)):
-        x, y, sw, sh, cx, cy = sample
-        raw_rgb, bright_rej, dark_rej = robust_patch_stats_rgb(
-            img_rgb,
-            x,
-            y,
-            x + sw,
-            y + sh,
-            reject_bright_pct=88.0,
-            reject_dark_pct=2.0,
-        )
-        cal_rgb = calibrate(raw_rgb)
-        meta = swatches[param]
-        local_blank_rgb = None
-        if param in WHITE_LIKE_PARAMS:
-            local_blank_rgb = estimate_local_blank_rgb(img_rgb, sample_rects, i, raw_rgb)
-        match = match_swatch(param, raw_rgb, cal_rgb, meta, prefer_raw=prefer_raw_matching, local_blank_rgb=local_blank_rgb)
-        match_errors.append(float(match["deltaE"]))
+    # Solo rechazamos iluminación realmente extrema. En v0.4 evitamos descartar fotos útiles.
+    white_luma = float(0.2126 * anchors["white"][0] + 0.7152 * anchors["white"][1] + 0.0722 * anchors["white"][2])
+    if white_luma < 55 or white_luma > 252 or cal_mean > 22 or cal_max > 45:
+        return {
+            "ok": True,
+            "version": VERSION,
+            "foundBars": True,
+            "retake": True,
+            "retakeReason": "La iluminación de la foto es demasiado extrema para obtener una lectura fiable.",
+            "warnings": warnings,
+            "results": [],
+            "diagnostics": {
+                "calibrationMeanDeltaE": round(cal_mean, 2),
+                "calibrationMaxDeltaE": round(cal_max, 2),
+                "whiteLuma": round(white_luma, 1),
+            },
+        }
 
-        # Temporary confidence; refined after global quality is known.
-        confidence_tmp = "low"
-        if match["deltaE"] < 8 and match["deltaE2"] - match["deltaE"] > 2:
-            confidence_tmp = "high"
-        elif match["deltaE"] < 15 and match["deltaE2"] - match["deltaE"] > 1:
-            confidence_tmp = "medium"
-        if confidence_tmp == "low":
-            low_conf_count += 1
+    results = []
+    low_count = 0
+    for i, param in enumerate(PARAM_ORDER):
+        chosen, mode, raw_match, can_match = choose_match(param, raw_seq[i], canonical_seq[i], anchors["white"])
+        if chosen is None:
+            continue
 
-        numeric = float(match["numeric_value"])
-        status = classify_result(param, numeric, meta)
-        used_rgb = match["used_rgb"]
+        confidence = confidence_for(raw_match, can_match, mode)
+        if confidence == "low":
+            low_count += 1
+
+        chosen_space_rgb = chosen["canonical_rgb"] if mode in ("canonical", "agree") else chosen["rgb"]
+        used_rgb = canonical_seq[i] if mode in ("canonical", "agree") else raw_seq[i]
+        d1 = delta_e76(used_rgb, chosen_space_rgb)
+
+        # deltaE2 del espacio finalmente usado
+        final_match = can_match if mode in ("canonical", "agree") else raw_match
+        d2 = float(final_match.get("delta2", d1 + 20.0))
 
         results.append(
             {
-                "index": i + 1,
                 "parameter": param,
-                "label": meta.get("label", param),
-                "short_label": meta.get("short_label", meta.get("label", param)),
-                "value": str(match["value"]),
-                "numeric_value": numeric,
-                "unit": meta.get("unit", ""),
-                "status": status,
-                "confidence": confidence_tmp,
-                "deltaE": round(float(match["deltaE"]), 2),
-                "deltaE2": round(float(match["deltaE2"]), 2),
-                "mode": match["mode"],
-                "reference_rgb": match["reference_rgb"],
-                "sample_point": {"x": int(cx), "y": int(cy)},
-                "sample_rect": {"x": int(x), "y": int(y), "w": int(sw), "h": int(sh)},
-                "sample_rgb_raw": to_int_list(raw_rgb),
-                "sample_rgb_calibrated": to_int_list(cal_rgb),
-                "sample_rgb_used": to_int_list(used_rgb),
-                "local_blank_rgb": to_int_list(local_blank_rgb) if local_blank_rgb is not None else None,
-                "local_blank_deltaE": round(float(delta_e(rgb_to_lab_cv(raw_rgb), rgb_to_lab_cv(local_blank_rgb))), 2) if local_blank_rgb is not None else None,
-                "glareRejectedPct": round(float(bright_rej), 2),
-                "darkRejectedPct": round(float(dark_rej), 2),
+                "value": chosen["value"],
+                "confidence": confidence,
+                "mode": "global" if mode in ("canonical", "agree") else "raw",
+                "decision": mode,
+                "sample_rgb_raw": [int(round(x)) for x in raw_seq[i]],
+                "sample_rgb_global": [int(round(x)) for x in canonical_seq[i]],
+                "sample_rgb_used": [int(round(x)) for x in used_rgb],
+                "reference_rgb": [int(round(x)) for x in chosen["rgb"]],
+                "reference_rgb_canonical": [int(round(x)) for x in chosen["canonical_rgb"]],
+                "deltaE": round(float(d1), 2),
+                "deltaE2": round(float(d2), 2),
+                "rawDeltaE": round(float(raw_match.get("delta", 999.0)), 2),
+                "canonicalDeltaE": round(float(can_match.get("delta", 999.0)), 2),
+                "sample_point": points[i],
+                "glareRejectedPct": round(float(glare[i]), 1),
             }
         )
 
-    # Quality score combines reference calibration stability, match distance and geometry.
-    match_mean = float(np.mean(match_errors)) if match_errors else 99.0
-    match_penalty = min(match_mean / 20.0, 1.0)
-    ref_penalty = min(ref_error_mean / 18.0, 1.0)
-    edge_penalty = 0.0 if geom["edge_peaks_count"] >= 8 else min((8 - geom["edge_peaks_count"]) / 8.0, 1.0)
-    strip_penalty = 0.0 if geom["strip_width"] >= 24 else 0.25
+    if low_count >= 4:
+        warnings.append("Varias lecturas tienen poca separación respecto al color vecino de la escala.")
 
-    quality_score = max(0.0, 1.0 - (0.48 * match_penalty + 0.36 * ref_penalty + 0.11 * edge_penalty + 0.05 * strip_penalty))
-    quality_score = round(float(quality_score), 3)
-
-    # Update confidence labels using final quality.
-    low_conf_count = 0
-    for r in results:
-        r["confidence"] = confidence_from_distances(float(r["deltaE"]), float(r["deltaE2"]), quality_score)
-        if r["confidence"] == "low":
-            low_conf_count += 1
-
-    if prefer_raw_matching:
-        warnings.append("Calibración conservadora activada: se evita una corrección RGB agresiva por residuo alto en las barras de referencia")
-    if ref_error_mean > 13.0:
-        warnings.append("Calibración de color sensible: la luz no parece uniforme sobre la plantilla")
-    if ref_error_max > 25.0:
-        warnings.append("Una o más barras de referencia no calibran bien; posible sombra, brillo o desenfoque")
-    if geom["edge_peaks_count"] < 8:
-        warnings.append("Detección débil de separaciones entre pads; posible foto desenfocada o tira mal colocada")
-    if low_conf_count >= 4:
-        warnings.append("Varias coincidencias tienen baja confianza; conviene repetir la foto con luz más uniforme")
-    if geom["strip_width"] < 24:
-        warnings.append("La tira aparece estrecha; acerca la cámara o usa mayor resolución")
-
-    photo_status = "ok" if quality_score >= 0.42 else "foto_no_fiable"
-
-    # Base44 compatibility:
-    # The current frontend/proxy treats `ok: false` or a non-`ok` top-level status
-    # as a transport error and shows the raw JSON as "Error proxy".
-    # If the image was actually processed and we have the 10 pad results, return a
-    # successful transport response and expose the low-quality verdict separately.
-    transport_ok = True
-    compatibility_status = "ok"
-
-    diagnostics: Dict[str, Any] = {
-        "version": APP_VERSION,
-        "imageSize": [int(w), int(h)],
+    return {
+        "ok": True,
+        "version": VERSION,
         "foundBars": True,
-        "foundPads": 10,
-        "transformType": "per_channel_linear_srgb",
-        "matchingMode": "raw_conservative" if prefer_raw_matching else "calibrated",
-        "deltaEFormula": "CIEDE2000",
-        "referenceErrorMean": round(ref_error_mean, 2),
-        "referenceErrorMax": round(ref_error_max, 2),
-        "referenceErrorsDeltaE": ref_errors_de,
-        "barsObservedRGB": {k: to_int_list(v) for k, v in measured_refs.items()},
-        "barsCorrectedRGB": ref_corrected,
-        "barsTargetRGB": TARGET_BARS_RGB,
-        "barsRejectedPct": bar_rejections,
+        "retake": False,
         "warnings": warnings,
-        "geometry": {
-            "orientation": geom["orientation"],
-            "stripX": [int(geom["strip_left"]), int(geom["strip_right"])],
-            "stripWidth": int(geom["strip_width"]),
-            "barsY": [int(geom["bars_y_top"]), int(geom["bars_y_bottom"])],
-            "padsY": [int(geom["pads_y_top"]), int(geom["pads_y_bottom"])],
-            "barRects": {k: [int(x) for x in v] for k, v in geom["rects"].items()},
-            "barCentersX": {k: int(v) for k, v in geom["centers_x"].items()},
-            "edgePeaksCount": int(geom["edge_peaks_count"]),
-            "edgePeaks": geom["edge_peaks"] if debug else [],
-        },
-    }
-    if debug:
-        diagnostics["calibrationParams"] = cal_params.round(6).tolist()
-        diagnostics["sampleRects"] = [
-            {"parameter": p, "x": int(x), "y": int(y), "w": int(sw), "h": int(sh), "cx": int(cx), "cy": int(cy)}
-            for p, (x, y, sw, sh, cx, cy) in zip(PARAM_ORDER, sample_rects)
-        ]
-
-    return {
-        "ok": transport_ok,
-        "status": compatibility_status,
-        "photo_status": photo_status,
-        "quality_score": quality_score,
-        "analysis_id": None,
-        "orientation": geom["orientation"],
         "results": results,
-        "diagnostics": diagnostics,
-        "retake_reason": None if photo_status == "ok" else "La foto no es suficientemente fiable para una medición automática",
-        "retake_tips": []
-        if photo_status == "ok" and not warnings
-        else [
-            "Usa luz uniforme y evita reflejos directos sobre la tira",
-            "Mantén la cámara perpendicular a la plantilla",
-            "Centra la tira entre las barras azul y verde",
-            "Asegura enfoque nítido y que se vean completas las barras de referencia",
-        ],
-    }
-
-
-def analyze_image(img_rgb: np.ndarray, debug: bool = False) -> Dict[str, Any]:
-    """Analyze an image, retrying common phone/gallery rotations.
-
-    Some Android/gallery uploads preserve pixels in landscape orientation even
-    when the visual preview looks rotated in the browser. The detector expects
-    vertical reference bars, so try rotations and keep the best successful scan.
-    """
-
-    rotations: List[Tuple[str, Optional[int]]] = [
-        ("none", None),
-        ("cw90", cv2.ROTATE_90_CLOCKWISE),
-        ("ccw90", cv2.ROTATE_90_COUNTERCLOCKWISE),
-        ("180", cv2.ROTATE_180),
-    ]
-    successes: List[Dict[str, Any]] = []
-    failures: List[str] = []
-
-    for label, code in rotations:
-        candidate = img_rgb if code is None else cv2.rotate(img_rgb, code)
-        try:
-            result = _analyze_image_impl(candidate, debug=debug)
-            result.setdefault("diagnostics", {})["inputRotationApplied"] = label
-            result.setdefault("diagnostics", {})["originalImageSize"] = [int(img_rgb.shape[1]), int(img_rgb.shape[0])]
-            successes.append(result)
-        except Exception as exc:
-            failures.append(f"{label}: {exc}")
-
-    if not successes:
-        raise ValueError("No se pudo detectar la plantilla en ninguna orientación: " + " | ".join(failures))
-
-    # Prefer the highest quality score. In ties, prefer no rotation to keep debug
-    # coordinates closer to the uploaded image.
-    def rank(item: Dict[str, Any]) -> Tuple[float, int]:
-        label = item.get("diagnostics", {}).get("inputRotationApplied", "none")
-        no_rotation_bonus = 1 if label == "none" else 0
-        return (float(item.get("quality_score", 0.0)), no_rotation_bonus)
-
-    return sorted(successes, key=rank, reverse=True)[0]
-
-
-def failure_response(img_rgb: Optional[np.ndarray], message: str) -> Dict[str, Any]:
-    size = [0, 0]
-    if img_rgb is not None:
-        h, w = img_rgb.shape[:2]
-        size = [int(w), int(h)]
-    return {
-        "ok": False,
-        "status": "error",
-        "photo_status": "foto_no_fiable",
-        "quality_score": 0.0,
-        "analysis_id": None,
-        "orientation": None,
-        "results": [],
         "diagnostics": {
-            "version": APP_VERSION,
-            "imageSize": size,
-            "foundBars": False,
-            "foundPads": 0,
-            "warnings": [message],
+            "geometryScore": round(float(geometry["score"]), 3),
+            "padGridScore": round(float(grid_score), 2),
+            "padPitchPx": round(float(pitch / geometry["scale"]), 2),
+            "orientation": orientation,
+            "orientationScore": round(float(orientation_score_used), 2),
+            "orientationAlternativeScore": round(float(orientation_score_other), 2),
+            "calibrationMeanDeltaE": round(cal_mean, 2),
+            "calibrationMaxDeltaE": round(cal_max, 2),
+            "anchorRgb": {name: [int(round(x)) for x in anchors[name]] for name in ANCHOR_NAMES},
+            "whiteLuma": round(white_luma, 1),
         },
-        "retake_reason": "No se pudo analizar la tira en esta imagen",
-        "retake_tips": [
-            "Asegura que la plantilla completa aparece en la foto",
-            "Alinea la tira entre las franjas azul y verde",
-            "Evita sombras/reflejos fuertes",
-            "Haz la foto perpendicular y con buen enfoque",
-        ],
     }
-
-
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
-
-
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {"ok": True, "service": "ColorScale API", "version": APP_VERSION}
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {
         "ok": True,
-        "version": APP_VERSION,
-        "swatchesLoaded": SWATCHES_PATH.exists(),
-        "swatchesPath": str(SWATCHES_PATH),
-        "historyDbPath": str(HISTORY_DB_PATH),
+        "version": VERSION,
+        "swatchesLoaded": swatches_loaded(),
+        "parameters": PARAM_ORDER,
     }
 
 
-@app.post("/analyze-strip", response_model=AnalyzeResponse)
-def analyze_strip(req: AnalyzeReq, x_api_key: str = Header(default="")) -> Dict[str, Any]:
-    check_api_key(x_api_key)
-    img_rgb: Optional[np.ndarray] = None
-    start = time.time()
+@app.post("/analyze-strip")
+def analyze_strip(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     try:
-        img_rgb = load_image_from_request(req)
-        result = analyze_image(img_rgb, debug=bool(req.debug))
-    except HTTPException:
-        raise
+        img = decode_image_payload(payload)
+        return analyze_image(img)
     except Exception as exc:
-        result = failure_response(img_rgb, str(exc))
-
-    result["diagnostics"]["processingMs"] = int(round((time.time() - start) * 1000))
-
-    save_history = SAVE_HISTORY_DEFAULT if req.save_history is None else bool(req.save_history)
-    if save_history:
-        analysis_id, err = save_analysis(req, result)
-        result["analysis_id"] = analysis_id
-        if err:
-            result.setdefault("diagnostics", {}).setdefault("warnings", []).append(f"No se pudo guardar histórico: {err}")
-    return result
-
-
-@app.get("/history")
-def history(
-    client_id: Optional[str] = Query(default=None),
-    scan_id: Optional[str] = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
-    x_api_key: str = Header(default=""),
-) -> Dict[str, Any]:
-    check_api_key(x_api_key)
-    init_history_db()
-    where: List[str] = []
-    params: List[Any] = []
-    if client_id:
-        where.append("client_id = ?")
-        params.append(client_id)
-    if scan_id:
-        where.append("scan_id = ?")
-        params.append(scan_id)
-    sql = "SELECT id, created_at, client_id, scan_id, operator_id, location, status, quality_score, result_json FROM analyses"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-
-    try:
-        with sqlite3.connect(HISTORY_DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            rows = con.execute(sql, params).fetchall()
-        items = []
-        for row in rows:
-            payload = json.loads(row["result_json"])
-            items.append(
-                {
-                    "id": row["id"],
-                    "created_at": row["created_at"],
-                    "client_id": row["client_id"],
-                    "scan_id": row["scan_id"],
-                    "operator_id": row["operator_id"],
-                    "location": row["location"],
-                    "status": row["status"],
-                    "quality_score": row["quality_score"],
-                    "summary": [
-                        {
-                            "parameter": r.get("parameter"),
-                            "label": r.get("short_label") or r.get("label"),
-                            "value": r.get("value"),
-                            "unit": r.get("unit"),
-                            "status": r.get("status"),
-                            "confidence": r.get("confidence"),
-                        }
-                        for r in payload.get("results", [])
-                    ],
-                }
-            )
-        return {"ok": True, "items": items}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Cannot read history: {exc}") from exc
-
-
-@app.get("/history/{analysis_id}")
-def history_detail(analysis_id: str, x_api_key: str = Header(default="")) -> Dict[str, Any]:
-    check_api_key(x_api_key)
-    init_history_db()
-    try:
-        with sqlite3.connect(HISTORY_DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            row = con.execute(
-                "SELECT id, created_at, client_id, scan_id, operator_id, location, status, quality_score, result_json FROM analyses WHERE id = ?",
-                (analysis_id,),
-            ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Analysis not found")
         return {
-            "ok": True,
-            "id": row["id"],
-            "created_at": row["created_at"],
-            "client_id": row["client_id"],
-            "scan_id": row["scan_id"],
-            "operator_id": row["operator_id"],
-            "location": row["location"],
-            "status": row["status"],
-            "quality_score": row["quality_score"],
-            "result": json.loads(row["result_json"]),
+            "ok": False,
+            "version": VERSION,
+            "foundBars": False,
+            "error": str(exc),
         }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Cannot read analysis: {exc}") from exc
