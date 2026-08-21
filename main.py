@@ -12,7 +12,7 @@ import requests
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 app = FastAPI(title="ColorScale API", version=VERSION)
 app.add_middleware(
@@ -149,32 +149,22 @@ def parse_numeric_value(value: Any) -> float:
 
 
 def normalize_swatches(raw: Any) -> Dict[str, List[Dict[str, Any]]]:
-    """Tolera los formatos habituales usados en swatches.json."""
-    out: Dict[str, List[Dict[str, Any]]] = {p: [] for p in PARAM_ORDER}
+    """Normaliza el swatches.json real de ColorScale.
 
-    if isinstance(raw, dict):
-        iterable: List[Tuple[str, Any]] = []
-        for key, values in raw.items():
-            if isinstance(values, list):
-                for item in values:
-                    iterable.append((str(key), item))
-            elif isinstance(values, dict):
-                for value_key, item in values.items():
-                    if isinstance(item, dict):
-                        obj = dict(item)
-                        obj.setdefault("value", value_key)
-                        iterable.append((str(key), obj))
-                    else:
-                        iterable.append((str(key), {"value": value_key, "rgb": item}))
-    elif isinstance(raw, list):
-        iterable = []
-        for item in raw:
-            if isinstance(item, dict):
-                param = item.get("parameter") or item.get("param") or item.get("name")
-                if param:
-                    iterable.append((str(param), item))
-    else:
-        iterable = []
+    Formato principal:
+      {
+        "alkalinity": {
+          "values": [...],
+          "rgb": [[r,g,b], ...],
+          "numeric_values": [...]  # opcional; usado por GH
+        },
+        ...
+      }
+
+    Mantiene además compatibilidad con formatos antiguos basados en objetos
+    individuales {value, rgb}.
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {p: [] for p in PARAM_ORDER}
 
     aliases = {
         "ph": "pH",
@@ -188,34 +178,74 @@ def normalize_swatches(raw: Any) -> Dict[str, List[Dict[str, Any]]]:
         "aluminum": "aluminium",
     }
 
-    for param_raw, item in iterable:
-        pkey = aliases.get(param_raw.strip().lower(), param_raw.strip())
-        if pkey not in out:
-            continue
-        if isinstance(item, dict):
-            rgb = parse_rgb(item.get("rgb") or item.get("color_rgb") or item.get("color"))
-            value = item.get("value")
-            if value is None:
-                value = item.get("label")
-        else:
-            rgb = parse_rgb(item)
-            value = None
-        if rgb is None or value is None:
-            continue
+    def canonical_param(param_raw: Any) -> str:
+        text = str(param_raw).strip()
+        return aliases.get(text.lower(), text)
+
+    def add_item(param: str, value: Any, rgb_value: Any, numeric_value: Any = None) -> None:
+        if param not in out or value is None:
+            return
+        rgb = parse_rgb(rgb_value)
+        if rgb is None:
+            return
         can_rgb = apply_diag_affine(rgb.reshape(1, 3), NOMINAL_TO_CANONICAL).reshape(3)
-        out[pkey].append(
+        numeric = parse_numeric_value(numeric_value if numeric_value is not None else value)
+        out[param].append(
             {
                 "value": value,
                 "rgb": rgb.astype(np.float64),
                 "canonical_rgb": can_rgb.astype(np.float64),
-                "numeric": parse_numeric_value(value),
+                "numeric": numeric,
             }
         )
+
+    if isinstance(raw, dict):
+        for param_raw, block in raw.items():
+            param = canonical_param(param_raw)
+            if param not in out or not isinstance(block, dict):
+                continue
+
+            # Formato real del fichero suministrado por el cliente:
+            # arrays paralelos values + rgb (+ numeric_values opcional).
+            values = block.get("values")
+            rgbs = block.get("rgb")
+            numeric_values = block.get("numeric_values")
+
+            if isinstance(values, list) and isinstance(rgbs, list):
+                n = min(len(values), len(rgbs))
+                for i in range(n):
+                    numeric = None
+                    if isinstance(numeric_values, list) and i < len(numeric_values):
+                        numeric = numeric_values[i]
+                    add_item(param, values[i], rgbs[i], numeric)
+                continue
+
+            # Compatibilidad con formatos anteriores tipo:
+            # {"0": {"rgb": [...]}, "40": {"rgb": [...]}}
+            for value_key, item in block.items():
+                if isinstance(item, dict):
+                    value = item.get("value", value_key)
+                    rgb_value = item.get("rgb") or item.get("color_rgb") or item.get("color")
+                    add_item(param, value, rgb_value, item.get("numeric_value"))
+
+    elif isinstance(raw, list):
+        # Compatibilidad con lista plana: {parameter, value, rgb}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            param_raw = item.get("parameter") or item.get("param") or item.get("name")
+            if not param_raw:
+                continue
+            param = canonical_param(param_raw)
+            value = item.get("value")
+            if value is None:
+                value = item.get("label")
+            rgb_value = item.get("rgb") or item.get("color_rgb") or item.get("color")
+            add_item(param, value, rgb_value, item.get("numeric_value"))
 
     for p in out:
         out[p].sort(key=lambda x: x["numeric"])
     return out
-
 
 def load_swatches() -> Dict[str, List[Dict[str, Any]]]:
     try:
@@ -872,6 +902,8 @@ def health() -> Dict[str, Any]:
         "ok": True,
         "version": VERSION,
         "swatchesLoaded": swatches_loaded(),
+        "swatchesPath": os.path.abspath(SWATCHES_PATH),
+        "swatchCounts": {p: len(SWATCHES.get(p, [])) for p in PARAM_ORDER},
         "parameters": PARAM_ORDER,
     }
 
