@@ -12,7 +12,7 @@ import requests
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 app = FastAPI(title="ColorScale API", version=VERSION)
 app.add_middleware(
@@ -853,7 +853,7 @@ def analyze_image(img_bgr: np.ndarray) -> Dict[str, Any]:
         results.append(
             {
                 "parameter": param,
-                "value": chosen["value"],
+                "value": str(chosen["value"]),
                 "confidence": confidence,
                 "mode": "global" if mode in ("canonical", "agree") else "raw",
                 "decision": mode,
