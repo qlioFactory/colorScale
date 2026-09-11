@@ -12,7 +12,7 @@ import requests
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 
 app = FastAPI(title="ColorScale API", version=VERSION)
 app.add_middleware(
@@ -346,15 +346,15 @@ def longest_relevant_interval(binary: np.ndarray, center_index: int) -> Optional
     return start, end
 
 
-def detect_geometry(img_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
+def _detect_geometry_pass(img_bgr: np.ndarray, green_sat_min: int = 35, blue_sat_min: int = 30) -> Optional[Dict[str, Any]]:
     img, scale = resize_for_analysis(img_bgr)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
     masks = {
         "red": cv2.inRange(hsv, np.array([0, 65, 50]), np.array([20, 255, 255]))
                | cv2.inRange(hsv, np.array([165, 65, 50]), np.array([179, 255, 255])),
-        "green": cv2.inRange(hsv, np.array([25, 35, 25]), np.array([105, 255, 255])),
-        "blue": cv2.inRange(hsv, np.array([88, 30, 20]), np.array([170, 255, 255])),
+        "green": cv2.inRange(hsv, np.array([25, green_sat_min, 25]), np.array([105, 255, 255])),
+        "blue": cv2.inRange(hsv, np.array([88, blue_sat_min, 20]), np.array([170, 255, 255])),
     }
     comps = {name: elongated_components(mask) for name, mask in masks.items()}
 
@@ -459,6 +459,57 @@ def detect_geometry(img_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
         "vmin": vmin,
         "vmax": vmax,
     }
+
+
+def detect_geometry(img_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
+    """
+    Detector adaptativo v0.5.0.
+
+    Primero usa exactamente los umbrales de v0.4.x. Si la geometría no aparece,
+    o si la rejilla de pads resultante es débil, prueba un segundo pase más
+    selectivo en saturación para verde y azul. Esto evita que con luz intensa
+    fondos azulados/sombras queden unidos a la barra azul.
+
+    El segundo pase solo sustituye al estándar cuando mejora claramente la
+    rejilla, para no cambiar innecesariamente las fotos que ya funcionaban.
+    """
+    standard = _detect_geometry_pass(img_bgr, green_sat_min=35, blue_sat_min=30)
+
+    if standard is not None:
+        try:
+            c0, p0, g0 = detect_pad_centers(standard)
+            standard["_padCenters"] = c0
+            standard["_padPitch"] = p0
+            standard["_padGridScore"] = g0
+            standard["detectorMode"] = "standard"
+
+            # Una rejilla sólida no necesita segundo pase.
+            if g0 >= 220.0:
+                return standard
+        except Exception:
+            g0 = -1e18
+    else:
+        g0 = -1e18
+
+    selective = _detect_geometry_pass(img_bgr, green_sat_min=70, blue_sat_min=90)
+    if selective is not None:
+        try:
+            c1, p1, g1 = detect_pad_centers(selective)
+            selective["_padCenters"] = c1
+            selective["_padPitch"] = p1
+            selective["_padGridScore"] = g1
+            selective["detectorMode"] = "high-saturation-fallback"
+
+            if standard is None:
+                return selective
+
+            # Solo cambiamos de geometría si la alternativa mejora de forma clara.
+            if g1 >= g0 + 20.0:
+                return selective
+        except Exception:
+            pass
+
+    return standard
 
 
 def sample_oriented_rect(img_bgr: np.ndarray, origin: np.ndarray, u: np.ndarray, v: np.ndarray,
@@ -785,7 +836,13 @@ def analyze_image(img_bgr: np.ndarray) -> Dict[str, Any]:
             "results": [],
         }
 
-    centers_v, pitch, grid_score = detect_pad_centers(geometry)
+    if "_padCenters" in geometry:
+        centers_v = geometry["_padCenters"]
+        pitch = float(geometry["_padPitch"])
+        grid_score = float(geometry["_padGridScore"])
+    else:
+        centers_v, pitch, grid_score = detect_pad_centers(geometry)
+
     anchors = sample_reference_anchors(geometry)
     anchor_matrix = np.stack([anchors[name] for name in ANCHOR_NAMES])
     calibration = fit_diag_affine(anchor_matrix, CANONICAL_ANCHORS_RGB)
@@ -882,6 +939,7 @@ def analyze_image(img_bgr: np.ndarray) -> Dict[str, Any]:
         "warnings": warnings,
         "results": results,
         "diagnostics": {
+            "detectorMode": geometry.get("detectorMode", "standard"),
             "geometryScore": round(float(geometry["score"]), 3),
             "padGridScore": round(float(grid_score), 2),
             "padPitchPx": round(float(pitch / geometry["scale"]), 2),
