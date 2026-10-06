@@ -12,7 +12,7 @@ import requests
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 app = FastAPI(title="ColorScale API", version=VERSION)
 app.add_middleware(
@@ -462,55 +462,80 @@ def _detect_geometry_pass(img_bgr: np.ndarray, green_sat_min: int = 35, blue_sat
 
 
 def detect_geometry(img_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
+    """Detector adaptativo v0.6.0 con compatibilidad hacia atrás.
+
+    Si el detector estándar de v0.5 obtiene una rejilla sólida, se conserva
+    exactamente esa geometría para no mover lecturas que ya funcionaban. Solo
+    cuando no detecta la tarjeta (caso típico de fotos muy luminosas) o la
+    rejilla es débil, se prueban varios umbrales HSV y se escoge la alternativa
+    con mejor rejilla de 10 pads.
     """
-    Detector adaptativo v0.5.0.
+    def prepare(geometry: Optional[Dict[str, Any]], green_sat_min: int,
+                blue_sat_min: int) -> Optional[Dict[str, Any]]:
+        if geometry is None:
+            return None
+        try:
+            centers, pitch, grid_score = detect_pad_centers(geometry)
+        except Exception:
+            return None
+        geometry["_padCenters"] = centers
+        geometry["_padPitch"] = float(pitch)
+        geometry["_padGridScore"] = float(grid_score)
+        geometry["detectorMode"] = (
+            "standard" if (green_sat_min, blue_sat_min) == (35, 30)
+            else f"adaptive-hsv-g{green_sat_min}-b{blue_sat_min}"
+        )
+        geometry["detectorGreenSatMin"] = int(green_sat_min)
+        geometry["detectorBlueSatMin"] = int(blue_sat_min)
+        return geometry
 
-    Primero usa exactamente los umbrales de v0.4.x. Si la geometría no aparece,
-    o si la rejilla de pads resultante es débil, prueba un segundo pase más
-    selectivo en saturación para verde y azul. Esto evita que con luz intensa
-    fondos azulados/sombras queden unidos a la barra azul.
+    standard = prepare(_detect_geometry_pass(img_bgr, 35, 30), 35, 30)
+    if standard is not None and float(standard["_padGridScore"]) >= 150.0:
+        standard["detectorCandidateCount"] = 1
+        return standard
 
-    El segundo pase solo sustituye al estándar cuando mejora claramente la
-    rejilla, para no cambiar innecesariamente las fotos que ya funcionaban.
-    """
-    standard = _detect_geometry_pass(img_bgr, green_sat_min=35, blue_sat_min=30)
-
+    candidates = []
     if standard is not None:
-        try:
-            c0, p0, g0 = detect_pad_centers(standard)
-            standard["_padCenters"] = c0
-            standard["_padPitch"] = p0
-            standard["_padGridScore"] = g0
-            standard["detectorMode"] = "standard"
+        candidates.append(standard)
 
-            # Una rejilla sólida no necesita segundo pase.
-            if g0 >= 220.0:
-                return standard
-        except Exception:
-            g0 = -1e18
-    else:
-        g0 = -1e18
+    for green_sat_min, blue_sat_min in [
+        (50, 60),
+        (60, 80),
+        (70, 90),
+        (80, 70),
+        (85, 95),
+        (90, 110),
+    ]:
+        geometry = prepare(
+            _detect_geometry_pass(
+                img_bgr,
+                green_sat_min=green_sat_min,
+                blue_sat_min=blue_sat_min,
+            ),
+            green_sat_min,
+            blue_sat_min,
+        )
+        if geometry is not None:
+            candidates.append(geometry)
 
-    selective = _detect_geometry_pass(img_bgr, green_sat_min=70, blue_sat_min=90)
-    if selective is not None:
-        try:
-            c1, p1, g1 = detect_pad_centers(selective)
-            selective["_padCenters"] = c1
-            selective["_padPitch"] = p1
-            selective["_padGridScore"] = g1
-            selective["detectorMode"] = "high-saturation-fallback"
+    if not candidates:
+        return None
 
-            if standard is None:
-                return selective
+    def selection_score(geometry: Dict[str, Any]) -> float:
+        return float(geometry["_padGridScore"]) - 10.0 * float(geometry["score"])
 
-            # Solo cambiamos de geometría si la alternativa mejora de forma clara.
-            if g1 >= g0 + 20.0:
-                return selective
-        except Exception:
-            pass
+    candidates.sort(key=selection_score, reverse=True)
+    best = candidates[0]
 
-    return standard
+    # Si el estándar existía, exigimos una mejora clara para cambiar de
+    # geometría. Esto limita regresiones en fotos ya aceptadas por v0.5.
+    if standard is not None:
+        improvement = float(best["_padGridScore"]) - float(standard["_padGridScore"])
+        if best is not standard and improvement < 20.0:
+            best = standard
 
+    best["detectorCandidateCount"] = len(candidates)
+    return best
 
 def sample_oriented_rect(img_bgr: np.ndarray, origin: np.ndarray, u: np.ndarray, v: np.ndarray,
                          center_u: float, center_v: float, half_u: float, half_v: float,
@@ -689,6 +714,212 @@ def sample_pads(geometry: Dict[str, Any], centers_v: np.ndarray, pitch: float) -
     return np.asarray(rgbs, dtype=np.float64), glare, points
 
 
+
+# ---------------------------------------------------------------------------
+# Quality gate v0.6.0
+# ---------------------------------------------------------------------------
+
+def sample_reference_anchors_section(geometry: Dict[str, Any], center_fraction: float,
+                                     half_v_fraction: float = 0.10) -> Dict[str, np.ndarray]:
+    """Muestrea los cinco anclajes en una zona concreta de la tarjeta.
+
+    Se usa para comprobar si la calibración cambia demasiado entre la parte
+    superior e inferior de la foto (gradientes de luz, reflejos o plastificado).
+    """
+    img = geometry["img"]
+    u, v, origin = geometry["u"], geometry["v"], geometry["origin"]
+    coords = geometry["coords"]
+    length = geometry["vmax"] - geometry["vmin"]
+    center_v = geometry["vmin"] + float(center_fraction) * length
+
+    anchors: Dict[str, np.ndarray] = {}
+    for name in ("red", "green", "blue"):
+        geom = geometry[name]
+        patch = sample_oriented_rect(
+            img, origin, u, v,
+            coords[name][0], center_v,
+            max(2.0, 0.18 * geom["short"]), half_v_fraction * length,
+            15, 41,
+        )
+        anchors[name], _ = robust_patch_stats_rgb(patch, 0.10, 0.02)
+
+    d_rg = coords["green"][0] - coords["red"][0]
+    median_short = float(np.median([
+        geometry["red"]["short"], geometry["green"]["short"], geometry["blue"]["short"]
+    ]))
+
+    gray_u = coords["blue"][0] + 0.95 * d_rg
+    patch = sample_oriented_rect(
+        img, origin, u, v,
+        gray_u, center_v,
+        max(2.0, 0.18 * median_short), half_v_fraction * length,
+        15, 41,
+    )
+    anchors["gray"], _ = robust_patch_stats_rgb(patch, 0.10, 0.02)
+
+    white_u = coords["red"][0] - 0.95 * d_rg
+    patch = sample_oriented_rect(
+        img, origin, u, v,
+        white_u, center_v,
+        max(3.0, 0.22 * d_rg), half_v_fraction * length,
+        15, 41,
+    )
+    anchors["white"], _ = robust_patch_stats_rgb(patch, 0.12, 0.02)
+    return anchors
+
+
+def regional_calibration_disagreement(geometry: Dict[str, Any], raw_seq: np.ndarray) -> int:
+    """Cuenta parámetros cuya clase cambia calibrando con zona alta vs baja.
+
+    Una discrepancia grande no depende de cuál sea el valor químico real: es
+    una señal de que la propia fotografía no tiene iluminación/calibración
+    espacialmente estable.
+    """
+    regional_values: List[List[str]] = []
+    for fraction in (0.25, 0.75):
+        anchors = sample_reference_anchors_section(geometry, fraction, 0.10)
+        matrix = np.stack([anchors[name] for name in ANCHOR_NAMES])
+        calibration = fit_diag_affine(matrix, CANONICAL_ANCHORS_RGB)
+        canonical = apply_diag_affine(raw_seq, calibration)
+
+        values: List[str] = []
+        for i, param in enumerate(PARAM_ORDER):
+            match = nearest_match(param, canonical[i], "canonical")
+            item = match.get("item")
+            values.append(str(item["value"]) if item is not None else "")
+        regional_values.append(values)
+
+    return int(sum(a != b for a, b in zip(regional_values[0], regional_values[1])))
+
+
+def spatial_sampling_stability(geometry: Dict[str, Any], centers_v: np.ndarray, pitch: float,
+                               calibration: np.ndarray, white_rgb: np.ndarray,
+                               orientation: str) -> Dict[str, Any]:
+    """Comprueba robustez variando ligeramente el ROI de cada pad.
+
+    No pretende cambiar el resultado; solo verifica que pequeños movimientos
+    dentro del mismo pad no produzcan clasificaciones muy distintas.
+    """
+    img = geometry["img"]
+    u, v, origin = geometry["u"], geometry["v"], geometry["origin"]
+    ug = geometry["coords"]["green"][0]
+    ub = geometry["coords"]["blue"][0]
+    center_u = (ug + ub) / 2.0
+    gap = ub - ug
+
+    variants = [
+        # du (fracción gap), dv (fracción pitch), half_u, half_v
+        (0.000, 0.000, 0.13, 0.20),
+        (-0.035, 0.000, 0.11, 0.18),
+        (0.035, 0.000, 0.11, 0.18),
+        (0.000, -0.055, 0.11, 0.16),
+        (0.000, 0.055, 0.11, 0.16),
+        (0.000, -0.090, 0.10, 0.14),
+        (0.000, 0.090, 0.10, 0.14),
+    ]
+
+    classifications: List[List[str]] = []
+    for du, dv, half_u_frac, half_v_frac in variants:
+        seq = []
+        for center_v in centers_v:
+            patch = sample_oriented_rect(
+                img, origin, u, v,
+                center_u + du * gap,
+                float(center_v) + dv * pitch,
+                half_u_frac * gap,
+                half_v_frac * pitch,
+                19, 19,
+            )
+            rgb, _ = robust_patch_stats_rgb(patch, 0.12, 0.02)
+            seq.append(rgb)
+
+        raw = np.asarray(seq, dtype=np.float64)
+        if orientation == "reversed":
+            raw = raw[::-1]
+        canonical = apply_diag_affine(raw, calibration)
+
+        values = []
+        for i, param in enumerate(PARAM_ORDER):
+            chosen, _, _, _ = choose_match(param, raw[i], canonical[i], white_rgb)
+            values.append(str(chosen["value"]) if chosen is not None else "")
+        classifications.append(values)
+
+    parameter_consensus = []
+    for i, param in enumerate(PARAM_ORDER):
+        values = [row[i] for row in classifications]
+        counts: Dict[str, int] = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        top_value, top_count = max(counts.items(), key=lambda item: item[1])
+        parameter_consensus.append({
+            "parameter": param,
+            "value": top_value,
+            "consensus": float(top_count / len(values)),
+            "distinctValues": int(len(counts)),
+        })
+
+    consensus_values = [item["consensus"] for item in parameter_consensus]
+    unstable = sum(value < 0.60 for value in consensus_values)
+    return {
+        "meanConsensus": float(np.mean(consensus_values)),
+        "minConsensus": float(np.min(consensus_values)),
+        "unstableParameters": int(unstable),
+        "parameters": parameter_consensus,
+    }
+
+
+def anchor_longitudinal_variation(geometry: Dict[str, Any]) -> Dict[str, float]:
+    """Variación ΔE de las barras RGB a lo largo de la tarjeta."""
+    img = geometry["img"]
+    u, v, origin = geometry["u"], geometry["v"], geometry["origin"]
+    coords = geometry["coords"]
+    length = geometry["vmax"] - geometry["vmin"]
+    sections = [
+        geometry["vmin"] + 0.25 * length,
+        geometry["vmin"] + 0.50 * length,
+        geometry["vmin"] + 0.75 * length,
+    ]
+
+    result: Dict[str, float] = {}
+    for name in ("red", "green", "blue"):
+        geom = geometry[name]
+        rgbs = []
+        for center_v in sections:
+            patch = sample_oriented_rect(
+                img, origin, u, v,
+                coords[name][0], center_v,
+                max(2.0, 0.16 * geom["short"]), 0.09 * length,
+                13, 31,
+            )
+            rgb, _ = robust_patch_stats_rgb(patch, 0.12, 0.02)
+            rgbs.append(rgb)
+        deltas = [
+            delta_e76(rgbs[i], rgbs[j])
+            for i in range(3)
+            for j in range(i + 1, 3)
+        ]
+        result[name] = float(max(deltas) if deltas else 0.0)
+    return result
+
+
+def build_quality_retake_reason(reasons: List[str]) -> str:
+    if "regional-lighting" in reasons:
+        return (
+            "La iluminación o los reflejos cambian demasiado entre distintas zonas de la tarjeta. "
+            "Repita la foto con luz uniforme y evitando reflejos sobre el plástico o la tarjeta."
+        )
+    if "weak-pad-grid" in reasons or "orientation-ambiguous" in reasons:
+        return (
+            "La tira no se ha localizado con suficiente estabilidad. "
+            "Centre la tarjeta completa, mantenga el móvil paralelo y repita la foto."
+        )
+    if "spatial-instability" in reasons:
+        return (
+            "La lectura cambia demasiado dentro de varios pads. "
+            "Repita la foto evitando brillos y asegurando que la tira esté plana y enfocada."
+        )
+    return "La calidad de la captura no es suficiente para devolver una lectura fiable. Repita la fotografía."
+
 def nearest_match(param: str, rgb: np.ndarray, space: str) -> Dict[str, Any]:
     items = SWATCHES.get(param, [])
     if not items:
@@ -862,6 +1093,16 @@ def analyze_image(img_bgr: np.ndarray) -> Dict[str, Any]:
         raw_seq, canonical_seq, points, glare
     )
 
+    # v0.6: controles de calidad internos. No necesitan conocer el valor químico
+    # esperado; miden si la propia fotografía es estable y autoconsistente.
+    regional_disagreement = regional_calibration_disagreement(geometry, raw_seq)
+    stability = spatial_sampling_stability(
+        geometry, centers_v, pitch, calibration, anchors["white"], orientation
+    )
+    anchor_variation = anchor_longitudinal_variation(geometry)
+    anchor_variation_max = float(max(anchor_variation.values())) if anchor_variation else 0.0
+    orientation_margin = float(orientation_score_other - orientation_score_used)
+
     warnings = []
     if geometry["score"] > 1.0:
         warnings.append("La geometría de la tarjeta es menos nítida de lo habitual.")
@@ -870,8 +1111,9 @@ def analyze_image(img_bgr: np.ndarray) -> Dict[str, Any]:
     if abs(orientation_score_other - orientation_score_used) < 6.0:
         warnings.append("La orientación de la tira es poco concluyente.")
 
-    # Solo rechazamos iluminación realmente extrema. En v0.4 evitamos descartar fotos útiles.
     white_luma = float(0.2126 * anchors["white"][0] + 0.7152 * anchors["white"][1] + 0.0722 * anchors["white"][2])
+
+    # Primero mantenemos el rechazo físico extremo ya existente.
     if white_luma < 55 or white_luma > 252 or cal_mean > 22 or cal_max > 45:
         return {
             "ok": True,
@@ -882,9 +1124,62 @@ def analyze_image(img_bgr: np.ndarray) -> Dict[str, Any]:
             "warnings": warnings,
             "results": [],
             "diagnostics": {
+                "detectorMode": geometry.get("detectorMode", "adaptive"),
+                "padGridScore": round(float(grid_score), 2),
                 "calibrationMeanDeltaE": round(cal_mean, 2),
                 "calibrationMaxDeltaE": round(cal_max, 2),
                 "whiteLuma": round(white_luma, 1),
+                "regionalCalibrationDisagreement": int(regional_disagreement),
+                "spatialMeanConsensus": round(float(stability["meanConsensus"]), 3),
+            },
+        }
+
+    # Quality gate conservador, calibrado con los lotes reales de octubre.
+    # Solo se rechazan capturas que muestran señales claras de geometría o
+    # iluminación inestable; no se usa el valor químico esperado.
+    quality_reasons: List[str] = []
+    if float(grid_score) < 65.0:
+        quality_reasons.append("weak-pad-grid")
+    if orientation_margin < 5.0 and float(grid_score) < 150.0:
+        quality_reasons.append("orientation-ambiguous")
+    if int(regional_disagreement) >= 6:
+        quality_reasons.append("regional-lighting")
+    # La estabilidad espacial se usa de momento como aviso y solo provoca
+    # rechazo si es extremadamente mala. Los tonos claros son intrínsecamente
+    # próximos y no queremos descartar fotos útiles por una sola frontera.
+    if int(stability["unstableParameters"]) >= 4 and float(stability["meanConsensus"]) < 0.82:
+        quality_reasons.append("spatial-instability")
+    elif int(stability["unstableParameters"]) >= 3:
+        warnings.append("Varios pads están cerca de una frontera de color; conviene repetir la foto si el resultado no es coherente.")
+
+    if anchor_variation_max > 20.0:
+        warnings.append("Se detecta iluminación/reflejo desigual a lo largo de las barras de referencia.")
+
+    if quality_reasons:
+        return {
+            "ok": True,
+            "version": VERSION,
+            "foundBars": True,
+            "retake": True,
+            "retakeReason": build_quality_retake_reason(quality_reasons),
+            "warnings": warnings,
+            "results": [],
+            "diagnostics": {
+                "detectorMode": geometry.get("detectorMode", "adaptive"),
+                "detectorCandidateCount": int(geometry.get("detectorCandidateCount", 1)),
+                "geometryScore": round(float(geometry["score"]), 3),
+                "padGridScore": round(float(grid_score), 2),
+                "orientation": orientation,
+                "orientationMargin": round(orientation_margin, 2),
+                "calibrationMeanDeltaE": round(cal_mean, 2),
+                "calibrationMaxDeltaE": round(cal_max, 2),
+                "whiteLuma": round(white_luma, 1),
+                "regionalCalibrationDisagreement": int(regional_disagreement),
+                "spatialMeanConsensus": round(float(stability["meanConsensus"]), 3),
+                "spatialMinConsensus": round(float(stability["minConsensus"]), 3),
+                "spatialUnstableParameters": int(stability["unstableParameters"]),
+                "anchorLongitudinalDeltaEMax": round(anchor_variation_max, 2),
+                "qualityGateReasons": quality_reasons,
             },
         }
 
@@ -946,10 +1241,18 @@ def analyze_image(img_bgr: np.ndarray) -> Dict[str, Any]:
             "orientation": orientation,
             "orientationScore": round(float(orientation_score_used), 2),
             "orientationAlternativeScore": round(float(orientation_score_other), 2),
+            "orientationMargin": round(orientation_margin, 2),
             "calibrationMeanDeltaE": round(cal_mean, 2),
             "calibrationMaxDeltaE": round(cal_max, 2),
             "anchorRgb": {name: [int(round(x)) for x in anchors[name]] for name in ANCHOR_NAMES},
             "whiteLuma": round(white_luma, 1),
+            "regionalCalibrationDisagreement": int(regional_disagreement),
+            "spatialMeanConsensus": round(float(stability["meanConsensus"]), 3),
+            "spatialMinConsensus": round(float(stability["minConsensus"]), 3),
+            "spatialUnstableParameters": int(stability["unstableParameters"]),
+            "anchorLongitudinalDeltaE": {name: round(float(value), 2) for name, value in anchor_variation.items()},
+            "anchorLongitudinalDeltaEMax": round(anchor_variation_max, 2),
+            "qualityGate": "passed",
         },
     }
 
@@ -963,6 +1266,7 @@ def health() -> Dict[str, Any]:
         "swatchesPath": os.path.abspath(SWATCHES_PATH),
         "swatchCounts": {p: len(SWATCHES.get(p, [])) for p in PARAM_ORDER},
         "parameters": PARAM_ORDER,
+        "qualityGate": "v0.6-regional-and-spatial",
     }
 
 
